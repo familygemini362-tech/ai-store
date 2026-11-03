@@ -53,6 +53,7 @@
       </div>
       <div class="compose-foot">
         <label class="check"><input type="checkbox" id="forceScan"> บังคับสแกนความจำก่อนตอบ</label>
+        <label class="effort" id="effortLabel" hidden>🧠 ความคิด <select id="effortSelect"></select></label>
         <span class="muted small">Enter ส่ง · Shift+Enter ขึ้นบรรทัดใหม่</span>
       </div>
     </footer>
@@ -60,6 +61,7 @@
 
   <aside class="panel" id="panel" hidden>
     <nav class="tabs" id="tabs">
+      <button data-tab="artifacts">ชิ้นงาน<span class="tab-count" id="artCount"></span></button>
       <button data-tab="state" class="active">ชั้น 4</button>
       <button data-tab="summaries">ชั้น 2</button>
       <button data-tab="inspect">ตรวจสอบ</button>
@@ -95,6 +97,18 @@
         <input name="model_main" list="modelOptions">
       </label>
       <div class="model-info" data-for="model_main"></div>
+      <label>ระดับความคิดของตัวทำงานหลัก
+        <select name="main_effort">
+          <option value="">ค่าของโมเดล</option>
+          <option value="none">ไม่คิด</option>
+          <option value="minimal">น้อยมาก</option>
+          <option value="low">น้อย</option>
+          <option value="medium">กลาง</option>
+          <option value="high">มาก</option>
+          <option value="xhigh">มากที่สุด</option>
+        </select>
+      </label>
+      <p class="muted small">คิดมากขึ้น ตอบช้าและแพงขึ้น ใช้ได้เฉพาะโมเดลที่รองรับ reasoning แต่ละแชตปรับเองได้ที่ช่องพิมพ์</p>
     </fieldset>
 
     <details>

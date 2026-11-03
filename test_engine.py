@@ -17,14 +17,16 @@ class FakeClient:
         self.main_script = []
         self.fail_scan_ids = set()  # a shard containing one of these IDs always returns garbage
         self.calls = []
+        self.last_kw = {}
 
     def __call__(self, api_key):
         return self
 
-    def chat(self, model, messages, tools=None, tool_choice=None):
+    def chat(self, model, messages, tools=None, tool_choice=None, **kw):
         system = messages[0]["content"]
         user = messages[-1]["content"] if messages[-1]["role"] == "user" else ""
         self.calls.append(system[:20])
+        self.last_kw = kw
         usage = {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.001}
         if system == prompts.SUMMARIZE_SYSTEM:
             ids = [int(x) for x in re.search(r"Summarize turn IDs ([\d, ]+)\.", user).group(1).split(",")]
@@ -296,6 +298,92 @@ class EngineTest(unittest.TestCase):
             con.execute("INSERT INTO settings(key, value) VALUES('round_size', '3')")
         self.assertEqual(self.engine.get_settings()["compress_at"], 13)
 
+    def test_settings_reject_bad_effort(self):
+        with self.assertRaises(UserError):
+            self.engine.save_settings({"main_effort": "ultra"})
+        self.engine.save_settings({"main_effort": "high"})
+        self.assertEqual(self.engine.get_settings()["main_effort"], "high")
+
+    def test_set_effort_override_and_clear(self):
+        self.engine.save_settings({"main_effort": "medium"})
+        effort = self.engine.get_chat(self.chat)["effort"]
+        self.assertEqual(effort, {"value": "medium", "custom": None, "default": "medium"})
+        self.engine.set_effort(self.chat, "high")
+        effort = self.engine.get_chat(self.chat)["effort"]
+        self.assertEqual(effort, {"value": "high", "custom": "high", "default": "medium"})
+        self.engine.set_effort(self.chat, "")  # explicit model default, distinct from "use global"
+        effort = self.engine.get_chat(self.chat)["effort"]
+        self.assertEqual(effort, {"value": "", "custom": "", "default": "medium"})
+        self.engine.set_effort(self.chat, None)  # back to using the global default
+        effort = self.engine.get_chat(self.chat)["effort"]
+        self.assertEqual(effort, {"value": "medium", "custom": None, "default": "medium"})
+        with self.assertRaises(UserError):
+            self.engine.set_effort(self.chat, "ultra")
+
+    def test_main_call_gets_the_effective_reasoning_effort(self):
+        self.engine.set_effort(self.chat, "high")
+        self.fake.main_script = [{"content": "ok"}]
+        self.engine.send(self.chat, "hi")
+        self.assertEqual(self.fake.last_kw.get("reasoning"), {"effort": "high"})
+
+    def test_no_reasoning_kwarg_when_effort_is_model_default(self):
+        self.fake.main_script = [{"content": "ok"}]  # main_effort is "" by default
+        self.engine.send(self.chat, "hi")
+        self.assertNotIn("reasoning", self.fake.last_kw)
+
+    def test_reasoning_not_sent_for_summarizer_calls(self):
+        self.engine.set_effort(self.chat, "high")
+        self.fill(["apple", "banana", "cherry", "durian", "elder", "fig"])  # reaches compress_at (6)
+        self.assertNotIn("reasoning", self.fake.last_kw)  # last chat() call here was the summarizer's
+
+    def test_reasoning_details_carried_into_next_tool_round(self):
+        details = [{"type": "reasoning.text", "index": 0, "text": "thinking it through", "format": "x"}]
+        call = tool_call("add_note", text="x", source_id=1)
+        call["reasoning_details"] = details
+        self.fake.main_script = [call, {"content": "done"}]
+        seen = []
+        orig = self.fake.chat
+
+        def spy(model, messages, **kw):
+            if messages[0]["content"] == prompts.MAIN_SYSTEM:
+                seen.append(messages)
+            return orig(model, messages, **kw)
+        self.fake.chat = spy
+        self.engine.send(self.chat, "note it")
+        second_round = seen[-1]
+        assistant_with_calls = [m for m in second_round if m.get("role") == "assistant" and m.get("tool_calls")]
+        self.assertEqual(assistant_with_calls[-1]["reasoning_details"], details)
+
+    def test_thinking_events_emitted_during_stream(self):
+        fake = self.fake
+
+        def chat_stream(model, messages, on_text=None, on_reasoning=None, **kw):
+            msg, usage = fake.chat(model, messages, **kw)
+            if on_reasoning:
+                on_reasoning("คิดอยู่ครับ")
+            for piece in (msg.get("content") or "").split(" "):
+                if piece:
+                    on_text(piece + " ")
+            msg = dict(msg)
+            msg["reasoning"] = "คิดอยู่ครับ"
+            return msg, usage
+        fake.chat_stream = chat_stream
+        fake.main_script = [{"content": "hello there"}]
+        events = []
+        turn = self.engine.send(self.chat, "hi", on_event=events.append)
+        types = [e["type"] for e in events]
+        self.assertIn("thinking", types)
+        self.assertEqual("".join(e["text"] for e in events if e["type"] == "thinking"), "คิดอยู่ครับ")
+        self.assertEqual(turn["meta"]["effort"], "")
+        self.assertEqual(turn["meta"]["reasoning"], "คิดอยู่ครับ")
+
+    def test_meta_has_effort_and_reasoning(self):
+        self.engine.set_effort(self.chat, "low")
+        self.fake.main_script = [{"content": "done"}]
+        turn = self.engine.send(self.chat, "hi")
+        self.assertEqual(turn["meta"]["effort"], "low")
+        self.assertNotIn("reasoning", turn["meta"])  # the fake chat() does not return reasoning text
+
     def test_get_chat_compression_shape(self):
         chat = self.engine.get_chat(self.chat)
         self.assertEqual(chat["compression"], {
@@ -304,6 +392,114 @@ class EngineTest(unittest.TestCase):
             "default": {"compress_at": 6, "round_size": 2},
         })
         self.assertEqual(chat["layers"]["next_summary_at"], 6)
+
+    # ---------- artifacts ----------
+
+    PAGE = "<!doctype html><html><body><h1>Hello</h1><p>v1 body " + "x" * 3000 + "</p></body></html>"
+
+    def make_page(self):
+        self.fake.main_script = [
+            tool_call("create_artifact", key="hello-page", title="หน้าทดสอบ", kind="html", content=self.PAGE),
+            {"content": "สร้างหน้าแล้ว"},
+        ]
+        return self.engine.send(self.chat, "ทำหน้าเว็บให้หน่อย")
+
+    def test_artifact_create_edit_replace_and_read_versions(self):
+        turn = self.make_page()
+        self.assertTrue(turn["tools"][0]["result"].startswith("Created artifact hello-page v1"))
+        self.assertEqual(turn["meta"]["artifacts"][0]["version"], 1)
+        self.fake.main_script = [
+            tool_call("update_artifact", key="hello-page", edits=[{"old": "<h1>Hello</h1>", "new": "<h1>สวัสดี</h1>"}]),
+            tool_call("update_artifact", key="hello-page", content="<p>replaced</p>", title="ใหม่"),
+            tool_call("read_artifact", key="hello-page", version=2),
+            {"content": "ok"},
+        ]
+        turn = self.engine.send(self.chat, "แก้หัวข้อ")
+        results = [t["result"] for t in turn["tools"]]
+        self.assertTrue(results[0].startswith("Updated hello-page v2"))
+        self.assertTrue(results[1].startswith("Updated hello-page v3"))
+        self.assertIn("<h1>สวัสดี</h1>", results[2])
+        self.assertEqual(turn["meta"]["artifacts"], [
+            {"id": turn["meta"]["artifacts"][0]["id"], "key": "hello-page", "title": "ใหม่", "kind": "html", "version": 3}])
+        [listed] = self.engine.get_chat(self.chat)["artifacts"]
+        self.assertEqual((listed["version"], listed["versions"], listed["title"]), (3, 3, "ใหม่"))
+        latest = self.engine.get_artifact(self.chat, listed["id"])
+        self.assertEqual(latest["content"], "<p>replaced</p>")
+        self.assertEqual([v["version"] for v in latest["versions"]], [1, 2, 3])
+        v1 = self.engine.get_artifact(self.chat, listed["id"], 1)
+        self.assertEqual((v1["content"], v1["title"]), (self.PAGE, "หน้าทดสอบ"))
+
+    def test_artifact_edit_must_match_exactly_once(self):
+        self.make_page()
+        self.fake.main_script = [
+            tool_call("update_artifact", key="hello-page", edits=[{"old": "missing", "new": "x"}]),
+            tool_call("update_artifact", key="hello-page", edits=[{"old": "<h1>Hello</h1>", "new": "A"},
+                                                                  {"old": "x", "new": "y"}]),  # 2nd: 3000 matches
+            tool_call("update_artifact", key="hello-page"),  # neither content nor edits
+            {"content": "ok"},
+        ]
+        turn = self.engine.send(self.chat, "edit")
+        results = [t["result"] for t in turn["tools"]]
+        self.assertIn("edit 0: old text occurs 0 times", results[0])
+        self.assertIn("edit 1: old text occurs", results[1])
+        self.assertIn("exactly one of content", results[2])
+        [a] = self.engine.list_artifacts(self.chat)
+        self.assertEqual(a["version"], 1)  # nothing was saved
+
+    def test_artifact_rejects_bad_input(self):
+        self.make_page()
+        self.fake.main_script = [
+            tool_call("create_artifact", key="hello-page", title="t", kind="html", content="x"),
+            tool_call("create_artifact", key="Bad Key", title="t", kind="html", content="x"),
+            tool_call("create_artifact", key="ok-key", title="t", kind="pdf", content="x"),
+            tool_call("read_artifact", key="nope"),
+            {"content": "ok"},
+        ]
+        results = [t["result"] for t in self.engine.send(self.chat, "more")["tools"]]
+        self.assertIn("already exists", results[0])
+        self.assertIn("key must be", results[1])
+        self.assertIn("kind must be", results[2])
+        self.assertIn("no artifact", results[3])
+        self.assertEqual(len(self.engine.list_artifacts(self.chat)), 1)
+
+    def test_artifact_content_stays_out_of_trace_and_summaries(self):
+        turn = self.make_page()
+        self.assertEqual(turn["tools"][0]["args"]["content"], f"<{len(self.PAGE):,} chars>")
+        with self.engine.db() as con:
+            row = con.execute("SELECT * FROM turns WHERE chat_id = ? AND tid = 1", (self.chat,)).fetchone()
+        text = self.engine._turn_text(row, self.engine.get_settings())
+        self.assertNotIn("x" * 100, text)
+        self.assertLess(len(text), 1500)
+
+    def test_artifact_listed_in_layer4_and_streamed(self):
+        events = []
+        self.fake.main_script = [
+            tool_call("create_artifact", key="calc", title="Calculator", kind="code", language="python",
+                      content="print(1 + 1)\n"),
+            {"content": "done"},
+        ]
+        self.engine.send(self.chat, "write code", on_event=events.append)
+        art = [e for e in events if e["type"] == "artifact"]
+        self.assertEqual(art[0]["artifact"]["key"], "calc")
+        self.assertEqual(art[0]["artifact"]["version"], 1)
+        tool_ev = [e for e in events if e["type"] == "tool"][0]
+        self.assertEqual(tool_ev["args"]["content"], "<13 chars>")
+        with self.engine.db() as con:
+            state = self.engine._render_state(con, self.chat, 2, self.engine.get_settings(), [])
+        self.assertIn("- calc: Calculator [code/python] v1, 13 chars", state)
+        self.assertNotIn("print(1 + 1)", state)
+
+    def test_artifact_belongs_to_its_chat_and_is_deleted_with_it(self):
+        self.make_page()
+        [a] = self.engine.list_artifacts(self.chat)
+        other = self.engine.create_chat()
+        with self.assertRaises(UserError):
+            self.engine.get_artifact(other, a["id"])
+        self.assertEqual(len(self.engine.export_chat(self.chat)["artifacts"][0]["versions"]), 1)
+        self.engine.delete_chat(self.chat)
+        with self.engine.db() as con:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM artifact_versions").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

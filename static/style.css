@@ -117,6 +117,7 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 5px; font-si
   height: 100dvh;
   transition: grid-template-columns .2s ease;
 }
+.app.wide-panel { --panel-w: min(52vw, 860px); }
 .app.panel-closed, .app.no-chat { grid-template-columns: 260px minmax(0, 1fr) 0; }
 .app.panel-closed .panel { visibility: hidden; }
 .scrim { display: none; }
@@ -147,6 +148,16 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 5px; font-si
 .chat-list .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
 .chat-list .m { font-size: 12px; color: var(--muted); }
 .chat-list .none { color: var(--muted); font-size: 13px; padding: 8px 10px; cursor: default; }
+.busy-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 5px;
+  vertical-align: 1px;
+  animation: blink 1s steps(2) infinite;
+}
 .chat-list .none:hover { background: none; }
 
 /* main */
@@ -302,6 +313,25 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 5px; font-si
   .app, .panel { transition: none; }
 }
 
+.thinking {
+  border-left: 3px solid var(--border-strong);
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.thinking summary { cursor: pointer; font-weight: 600; }
+.thinking-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  max-height: 240px;
+  margin-top: 6px;
+  color: var(--muted);
+}
+
 .md .txt { white-space: pre-wrap; overflow-wrap: anywhere; }
 .md pre { background: var(--code-bg); padding: 10px 12px; border-radius: 10px; overflow: auto; font-size: 13px; border: 1px solid var(--border); }
 .md .h { font-weight: 700; }
@@ -334,6 +364,8 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 5px; font-si
 .compose-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
 .check { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); cursor: pointer; }
 .check input { width: auto; }
+.effort { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+.effort select { width: auto; padding: 2px 6px; border-radius: 8px; font-size: 12.5px; }
 .status { font-size: 13px; color: var(--accent); min-height: 20px; padding: 0 4px 4px; }
 .status.err { color: var(--danger); }
 
@@ -347,7 +379,9 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 5px; font-si
   min-width: 0;
   overflow: hidden;
 }
-.tabs { display: flex; border-bottom: 1px solid var(--border); align-items: center; padding-right: 6px; }
+.tabs { display: flex; border-bottom: 1px solid var(--border); align-items: center; padding-right: 6px; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs .panel-close { position: sticky; right: 0; background: var(--surface); flex: 0 0 auto; }
 .tabs button[data-tab] {
   flex: 1;
   border: none;
@@ -414,8 +448,79 @@ dialog .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
 .model-info.warn { color: var(--warn); }
 .dialog-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; margin-top: 16px; flex-wrap: wrap; }
 
+/* artifacts */
+.tab-count:not(:empty) {
+  margin-left: 5px;
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 0 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.art-cards { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.art-cards:empty { display: none; }
+.art-card, .art-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 420px;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 12px;
+}
+.art-card:hover, .art-row:hover { border-color: var(--accent); background: var(--surface); }
+.art-row { max-width: none; }
+.art-icon { font-size: 20px; line-height: 1; }
+.art-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.art-meta b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+.art-list { display: flex; flex-direction: column; gap: 8px; }
+.panel-body.art-mode { padding: 0; gap: 0; overflow: hidden; flex: 1; min-height: 0; }
+.art-viewer { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.art-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.art-title { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.art-title b { font-size: 14px; }
+.art-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.art-tools select { width: auto; padding: 2px 8px; font-size: 13px; border-radius: 8px; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg button { border: none; border-radius: 0; padding: 2px 10px; font-size: 13px; background: var(--surface); }
+.seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.art-stage { flex: 1; min-height: 0; overflow: auto; display: flex; }
+.art-stage iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+.art-stage.svg {
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: repeating-conic-gradient(var(--surface-2) 0% 25%, var(--surface) 0% 50%) 50% / 20px 20px;
+}
+.art-stage.svg img { max-width: 100%; max-height: 100%; }
+.art-stage.doc { display: block; padding: 16px 20px; }
+.art-code {
+  margin: 0;
+  flex: 1;
+  padding: 12px 14px;
+  background: var(--code-bg);
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 4;
+}
+
 /* narrower screens: the panel slides over the chat instead of taking a column */
 @media (max-width: 1100px) {
+  .app.wide-panel .panel { width: 100vw; }
   .app, .app.panel-closed, .app.no-chat { grid-template-columns: 230px minmax(0, 1fr); }
   .panel {
     position: fixed;

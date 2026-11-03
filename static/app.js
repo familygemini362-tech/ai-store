@@ -9,9 +9,13 @@ const S = {
   models: null,
   tab: "state",
   inspectTid: null,
-  sending: false,
+  inflight: new Map(), // chat id -> { nodes, status } for replies still streaming
+  failed: new Map(), // chat id -> { text, error } for sends that failed while that chat was not open
   scanResult: null,
   summaryFilter: "",
+  artifact: null, // { id, version } open in the artifacts tab; version null = latest
+  artMode: "preview",
+  artCache: new Map(), // `${chat}:${id}:${version}` -> artifact with content (versions never change)
 };
 
 // ---------- helpers ----------
@@ -62,6 +66,18 @@ function setStatus(text, isErr = false) {
   s.classList.toggle("err", isErr);
 }
 
+const EFFORT_LABEL = {
+  "": "ค่าของโมเดล",
+  none: "ไม่คิด",
+  minimal: "น้อยมาก",
+  low: "น้อย",
+  medium: "กลาง",
+  high: "มาก",
+  xhigh: "มากที่สุด",
+};
+const EFFORT_LEVELS = ["", "none", "minimal", "low", "medium", "high", "xhigh"];
+const effortLabel = (v) => EFFORT_LABEL[v ?? ""] ?? (v || "—");
+
 const TOOL_LABEL = {
   search_memory: "ค้นความจำเก่า",
   read_full: "อ่านข้อความเต็ม",
@@ -69,6 +85,9 @@ const TOOL_LABEL = {
   record_decision: "บันทึกข้อตัดสินใจ (4a)",
   add_note: "จดโน้ต (4b)",
   retire_state: "จัดชั้น 4",
+  create_artifact: "สร้างชิ้นงาน",
+  update_artifact: "แก้ชิ้นงาน",
+  read_artifact: "อ่านชิ้นงาน",
 };
 const toolLabel = (name) => TOOL_LABEL[name] || name;
 
@@ -83,6 +102,7 @@ const narrow = () => window.matchMedia("(max-width: 1100px)").matches;
 function setPanel(open, remember = true) {
   $("#app").classList.toggle("panel-closed", !open);
   $("#togglePanel").setAttribute("aria-expanded", String(open));
+  syncWidePanel();
   if (remember && !narrow()) {
     try { localStorage.setItem("panelOpen", open ? "1" : "0"); } catch {}
   }
@@ -114,18 +134,25 @@ async function loadChats() {
 async function openChat(id) {
   S.chatId = id;
   S.scanResult = null;
+  S.artifact = null;
   try { localStorage.setItem("lastChat", String(id)); } catch {}
+  setStatus(S.inflight.get(id)?.status || "");
   await refreshChat();
+  if (S.chatId === id) restoreFailed();
 }
 
 async function refreshChat() {
-  if (S.chatId == null) return render();
+  const id = S.chatId;
+  if (id == null) return render();
+  let chat = null;
   try {
-    S.chat = await api("GET", `/api/chats/${S.chatId}`);
+    chat = await api("GET", `/api/chats/${id}`);
   } catch (e) {
-    S.chatId = null;
-    S.chat = null;
+    chat = null;
   }
+  if (S.chatId !== id) return; // the user opened another chat while this one was loading
+  S.chat = chat;
+  if (!chat) S.chatId = null;
   render();
   watchSummarizer();
 }
@@ -139,19 +166,21 @@ function watchSummarizer() {
     let st;
     try { st = await api("GET", `/api/chats/${id}/status`); } catch { summaryWatch = null; return; }
     if (st.summarizing) {
-      if (!S.sending) setStatus("กำลังสรุปเทิร์นเก่าเข้าชั้น 2…");
+      if (!isSending(id)) setStatus("กำลังสรุปเทิร์นเก่าเข้าชั้น 2…");
       summaryWatch = setTimeout(tick, 1500);
     } else {
       summaryWatch = null;
-      if (!S.sending) setStatus(st.last_error || "", !!st.last_error);
+      if (!isSending(id)) setStatus(st.last_error || "", !!st.last_error);
       const before = S.chat?.layers?.archived;
-      S.chat = await api("GET", `/api/chats/${id}`);
+      const chat = await api("GET", `/api/chats/${id}`);
+      if (S.chatId !== id) return;
+      S.chat = chat;
       if (S.chat.layers.archived !== before) render();
       else renderHeader();
     }
   };
   if (S.chat.status.summarizing) tick();
-  else if (S.chat.status.last_error && !S.sending) setStatus(S.chat.status.last_error, true);
+  else if (S.chat.status.last_error && !isSending(id)) setStatus(S.chat.status.last_error, true);
 }
 
 // ---------- rendering ----------
@@ -164,6 +193,7 @@ function render() {
   $("#panel").hidden = !has;
   $("#emptyState").hidden = has;
   $("#app").classList.toggle("no-chat", !has);
+  syncComposer();
   if (!has) {
     $("#messages").querySelectorAll(".msg, .divider, .chat-empty").forEach((n) => n.remove());
     return;
@@ -180,7 +210,7 @@ function renderChatList() {
   for (const c of S.chats) {
     const li = el(`<li class="${c.id === S.chatId ? "active" : ""}">
       <span class="t">${esc(c.title)}</span>
-      <span class="m">${c.turns} เทิร์น · ${fmtUsd(c.cost)}</span></li>`);
+      <span class="m">${isSending(c.id) ? '<span class="busy-dot"></span>กำลังตอบ… · ' : ""}${c.turns} เทิร์น · ${fmtUsd(c.cost)}</span></li>`);
     li.onclick = () => openChat(c.id);
     ul.append(li);
   }
@@ -212,7 +242,36 @@ function renderHeader() {
     <span class="chip">ค่าใช้จ่าย <b>${fmtUsd(cost)}</b></span>`;
   const adjustBtn = $("#adjustCompress");
   if (adjustBtn) adjustBtn.onclick = openCompressDialog;
+  syncEffortControl();
 }
+
+function syncEffortControl() {
+  const label = $("#effortLabel");
+  const sel = $("#effortSelect");
+  const effort = S.chat?.effort;
+  if (!effort) { label.hidden = true; return; }
+  label.hidden = false;
+  sel.innerHTML = `<option value="__default__">ตามค่าเริ่มต้น (${esc(effortLabel(effort.default))})</option>`
+    + EFFORT_LEVELS.map((lv) => `<option value="${lv}">${esc(EFFORT_LABEL[lv])}</option>`).join("");
+  sel.value = effort.custom == null ? "__default__" : effort.custom;
+}
+
+$("#effortSelect").addEventListener("change", async () => {
+  const sel = $("#effortSelect");
+  const prev = S.chat.effort;
+  const v = sel.value;
+  try {
+    const body = { effort: v === "__default__" ? null : v };
+    const r = await api("PUT", `/api/chats/${S.chatId}/effort`, body);
+    S.chat.effort = r.effort;
+    syncEffortControl();
+    setStatus(`ใช้ระดับความคิด: ${effortLabel(r.effort.value)} กับข้อความถัดไป`);
+  } catch (e) {
+    setStatus(e.message, true);
+    S.chat.effort = prev;
+    syncEffortControl();
+  }
+});
 
 function userMsg(t, archived, pending = false) {
   const u = el(`<div class="msg user ${archived ? "archived" : ""} ${pending ? "pending" : ""}">
@@ -244,7 +303,7 @@ function turnChips(t) {
 function renderMessages() {
   const box = $("#messages");
   // A reply being streamed stays put when something else re-renders the chat (e.g. a summary finishing).
-  const inFlight = S.sendingChat === S.chatId ? [...box.querySelectorAll(".msg.pending, .msg.streaming")] : [];
+  const inFlight = S.inflight.get(S.chatId)?.nodes || [];
   box.querySelectorAll(".msg, .divider, .chat-empty").forEach((n) => n.remove());
   const turns = S.chat.turns;
   if (!turns.length && !inFlight.length) {
@@ -259,11 +318,18 @@ function renderMessages() {
       dividerDone = true;
     }
     box.append(userMsg(t, archived));
+    const reasoning = t.meta?.reasoning;
+    const thinking = reasoning ? `<details class="thinking">
+        <summary>ความคิดของโมเดล (${esc(effortLabel(t.meta?.effort))})</summary>
+        <div class="thinking-body">${esc(reasoning)}</div></details>` : "";
     const a = el(`<div class="msg assistant ${archived ? "archived" : ""}">
+      ${thinking}
       <div class="bubble md">${md(t.answer)}</div>
+      <div class="art-cards"></div>
       <div class="footer-chips">${turnChips(t).map((c) => `<span>${esc(c)}</span>`).join("")}
         <button class="link insp">ตรวจสอบ</button></div></div>`);
     a.querySelector(".insp").onclick = () => { S.inspectTid = t.tid; setPanel(true); setTab("inspect"); };
+    for (const art of t.meta?.artifacts || []) a.querySelector(".art-cards").append(artifactCard(art));
     box.append(a);
   }
   box.append(...inFlight);
@@ -281,7 +347,168 @@ function setTab(tab) {
 function renderPanel() {
   const body = $("#panelBody");
   body.innerHTML = "";
-  ({ state: panelState, summaries: panelSummaries, inspect: panelInspect, scan: panelScan })[S.tab](body);
+  body.classList.toggle("art-mode", S.tab === "artifacts" && !!S.artifact);
+  syncWidePanel();
+  const count = S.chat?.artifacts?.length || 0;
+  $("#artCount").textContent = count ? String(count) : "";
+  ({ artifacts: panelArtifacts, state: panelState, summaries: panelSummaries, inspect: panelInspect, scan: panelScan })[S.tab](body);
+}
+
+// ---------- artifacts ----------
+
+const ART_ICON = { html: "🌐", markdown: "📝", code: "💻", svg: "🖼" };
+const ART_KIND = { html: "หน้าเว็บ", markdown: "เอกสาร", code: "โค้ด", svg: "รูป SVG" };
+const EXT = {
+  python: "py", py: "py", javascript: "js", js: "js", typescript: "ts", ts: "ts", json: "json", css: "css",
+  sql: "sql", bash: "sh", sh: "sh", shell: "sh", java: "java", c: "c", cpp: "cpp", "c++": "cpp", go: "go", rust: "rs",
+};
+
+// The panel widens while an artifact is open, so a page preview has room.
+function syncWidePanel() {
+  const wide = S.tab === "artifacts" && !!S.artifact && !$("#app").classList.contains("panel-closed");
+  $("#app").classList.toggle("wide-panel", wide);
+}
+
+function openArtifact(id, version = null) {
+  S.artifact = { id, version };
+  setPanel(true);
+  setTab("artifacts");
+}
+
+function artifactCard(art) {
+  const card = el(`<button class="art-card" title="เปิดชิ้นงาน">
+    <span class="art-icon">${ART_ICON[art.kind] || "📄"}</span>
+    <span class="art-meta"><b>${esc(art.title)}</b><span class="muted small">${esc(ART_KIND[art.kind] || art.kind)} · v${Number(art.version)}</span></span>
+    <span class="link">เปิด</span></button>`);
+  card.onclick = () => openArtifact(art.id, art.version);
+  return card;
+}
+
+function artifactFilename(a) {
+  const ext = { html: "html", markdown: "md", svg: "svg" }[a.kind] || EXT[(a.language || "").toLowerCase()] || "txt";
+  return `${a.key}.${ext}`;
+}
+
+async function loadArtifact(chatId, id, version) {
+  if (version != null) {
+    const key = `${chatId}:${id}:${version}`;
+    if (!S.artCache.has(key)) S.artCache.set(key, await api("GET", `/api/chats/${chatId}/artifacts/${id}/versions/${version}`));
+    return S.artCache.get(key);
+  }
+  const a = await api("GET", `/api/chats/${chatId}/artifacts/${id}`);
+  S.artCache.set(`${chatId}:${id}:${a.version}`, a);
+  return a;
+}
+
+function panelArtifacts(body) {
+  if (S.artifact) return artifactViewer(body);
+  const list = S.chat.artifacts || [];
+  const wrap = el(`<div class="art-list"></div>`);
+  if (!list.length) {
+    wrap.append(el(`<p class="muted small">ยังไม่มีชิ้นงาน ขอให้โมเดลสร้างหน้าเว็บ เอกสาร หรือโค้ดยาว ๆ แล้วจะมาอยู่ที่นี่</p>`));
+  }
+  for (const a of list) {
+    const card = el(`<button class="card art-row">
+      <span class="art-icon">${ART_ICON[a.kind] || "📄"}</span>
+      <span class="art-meta"><b>${esc(a.title)}</b>
+        <span class="muted small">${esc(ART_KIND[a.kind] || a.kind)}${a.language ? " · " + esc(a.language) : ""} · v${Number(a.version)} · ${fmtNum(a.chars)} ตัวอักษร</span></span>
+    </button>`);
+    card.onclick = () => openArtifact(a.id);
+    wrap.append(card);
+  }
+  body.append(wrap);
+}
+
+function artifactViewer(body) {
+  const { id, version } = S.artifact;
+  const chatId = S.chatId;
+  const view = el(`<div class="art-viewer"><div class="art-bar"><span class="muted small">กำลังโหลดชิ้นงาน…</span></div></div>`);
+  body.append(view);
+  loadArtifact(chatId, id, version).then((a) => {
+    // Drop the result if the user moved on while it loaded.
+    if (S.chatId !== chatId || S.tab !== "artifacts" || S.artifact?.id !== id || !view.isConnected) return;
+    drawArtifact(view, a);
+  }).catch((e) => {
+    if (view.isConnected) view.querySelector(".art-bar").innerHTML = `<span class="error">${esc(e.message)}</span>`;
+  });
+}
+
+function drawArtifact(view, a) {
+  const latest = a.versions[a.versions.length - 1].version;
+  const canPreview = a.kind !== "code";
+  const mode = canPreview ? S.artMode : "code";
+  view.innerHTML = "";
+  const bar = el(`<div class="art-bar">
+    <div class="art-title">
+      <button class="link back">← ทั้งหมด</button>
+      <b>${ART_ICON[a.kind] || "📄"} ${esc(a.title)}</b>
+      <span class="badge">${esc(ART_KIND[a.kind] || a.kind)}${a.language ? " · " + esc(a.language) : ""}</span>
+    </div>
+    <div class="art-tools">
+      <select class="ver" aria-label="เวอร์ชัน">${a.versions.slice().reverse().map((v) =>
+        `<option value="${v.version}" ${v.version === a.version ? "selected" : ""}>v${v.version}${v.version === latest ? " (ล่าสุด)" : ""}</option>`).join("")}</select>
+      ${canPreview ? `<span class="seg"><button data-mode="preview" class="${mode === "preview" ? "on" : ""}">ตัวอย่าง</button><button data-mode="code" class="${mode === "code" ? "on" : ""}">โค้ด</button></span>` : ""}
+      <button class="small copy">คัดลอก</button>
+      <button class="small dl">ดาวน์โหลด</button>
+    </div></div>`);
+  bar.querySelector(".back").onclick = () => { S.artifact = null; renderPanel(); };
+  bar.querySelector(".ver").onchange = (e) => {
+    const v = Number(e.target.value);
+    S.artifact = { id: a.id, version: v === latest ? null : v };
+    renderPanel();
+  };
+  bar.querySelectorAll(".seg button").forEach((b) => {
+    b.onclick = () => { S.artMode = b.dataset.mode; drawArtifact(view, a); };
+  });
+  const copyBtn = bar.querySelector(".copy");
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(a.content);
+    } catch {
+      const t = el(`<textarea></textarea>`);
+      t.value = a.content;
+      document.body.append(t);
+      t.select();
+      document.execCommand("copy");
+      t.remove();
+    }
+    copyBtn.textContent = "คัดลอกแล้ว";
+    setTimeout(() => { copyBtn.textContent = "คัดลอก"; }, 1500);
+  };
+  bar.querySelector(".dl").onclick = () => {
+    const type = { html: "text/html", svg: "image/svg+xml", markdown: "text/markdown" }[a.kind] || "text/plain";
+    const url = URL.createObjectURL(new Blob([a.content], { type: type + ";charset=utf-8" }));
+    const link = el(`<a download="${esc(artifactFilename(a))}" href="${url}"></a>`);
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  view.append(bar);
+
+  const stage = el(`<div class="art-stage"></div>`);
+  if (mode === "code") {
+    stage.append(el(`<pre class="art-code"><code>${esc(a.content)}</code></pre>`));
+  } else if (a.kind === "html") {
+    // Sandboxed without allow-same-origin: the page's scripts run in an opaque origin and cannot
+    // read this app's data or call its API. Never open artifact HTML through a same-origin URL.
+    const frame = document.createElement("iframe");
+    frame.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-popups");
+    frame.setAttribute("referrerpolicy", "no-referrer");
+    frame.title = a.title;
+    frame.srcdoc = a.content;
+    stage.append(frame);
+  } else if (a.kind === "svg") {
+    const img = document.createElement("img"); // scripts inside an SVG do not run in <img>
+    img.alt = a.title;
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(a.content);
+    stage.classList.add("svg");
+    stage.append(img);
+  } else {
+    stage.classList.add("doc");
+    stage.append(el(`<div class="md">${md(a.content)}</div>`));
+  }
+  view.append(stage);
 }
 
 const KIND = {
@@ -424,6 +651,7 @@ function panelInspect(body) {
     <dt>ชั้น 4 ในรอบนี้</dt><dd>${fmtNum(m.state_chars)} ตัวอักษร</dd>
     <dt>ชั้น 1 ในรอบนี้</dt><dd>${m.live_ids?.length ? "ID " + m.live_ids[0] + "–" + m.live_ids[1] : "ไม่มีเทิร์นก่อนหน้า"}</dd>
     <dt>ค่าใช้จ่าย</dt><dd>${fmtUsd(m.cost)}</dd>
+    <dt>ระดับความคิด</dt><dd>${m.effort ? esc(effortLabel(m.effort)) : "—"}</dd>
     <dt>สถานะ</dt><dd>${m.stopped ? "หยุดเพราะ " + m.stopped : "ปกติ"}</dd></dl>`));
 
   body.append(el(`<h3>การสแกน</h3>`));
@@ -531,50 +759,102 @@ function autoGrow() {
   t.style.height = Math.min(t.scrollHeight, 220) + "px";
 }
 
+// Each chat sends on its own: a reply streaming in one chat never blocks typing in another.
+const isSending = (id) => S.inflight.has(id);
+
+function setChatStatus(id, text, isErr = false) {
+  const job = S.inflight.get(id);
+  if (job) job.status = text;
+  if (id === S.chatId) setStatus(text, isErr);
+}
+
+function syncComposer() {
+  $("#sendBtn").disabled = isSending(S.chatId);
+}
+
 async function send() {
   const input = $("#input");
   const text = input.value.trim();
-  if (!text || S.sending || !S.chat) return;
+  const id = S.chatId;
+  if (!text || !S.chat || isSending(id)) return;
   const forceScan = $("#forceScan").checked;
-  S.sending = true;
-  S.sendingChat = S.chatId;
-  $("#sendBtn").disabled = true;
   input.value = "";
   autoGrow();
+  $("#forceScan").checked = false;
   $("#messages").querySelector(".chat-empty")?.remove();
 
   const box = $("#messages");
   const userEl = userMsg({ user: text }, false, true);
   const live = el(`<div class="msg assistant streaming">
     <div class="steps"></div>
-    <div class="bubble md"><span class="typing"><i></i><i></i><i></i></span></div></div>`);
+    <div class="bubble md"><span class="typing"><i></i><i></i><i></i></span></div>
+    <div class="art-cards"></div></div>`);
+  const liveCards = new Map(); // artifact id -> its card in this reply
+  let openedArtifact = false;
+  S.inflight.set(id, { nodes: [userEl, live], status: "" });
+  syncComposer();
+  renderChatList();
   box.append(userEl, live);
   box.scrollTop = box.scrollHeight;
-  setStatus("กำลังเริ่ม…");
+  setChatStatus(id, "กำลังเริ่ม…");
 
   const bubble = live.querySelector(".bubble");
   const steps = live.querySelector(".steps");
   let answer = "";
+  let thinking = "";
+  let thinkingEl = null;
+  let collapsedThinking = false;
   let frame = 0;
   const paint = () => {
     frame = 0;
-    const stick = nearBottom(box);
+    const shown = S.chatId === id;
+    const stick = shown && nearBottom(box);
+    if (thinkingEl) {
+      const tbody = thinkingEl.querySelector(".thinking-body");
+      tbody.innerHTML = esc(thinking);
+      if (shown) tbody.scrollTop = tbody.scrollHeight;
+    }
     bubble.innerHTML = answer ? md(answer) : `<span class="typing"><i></i><i></i><i></i></span>`;
     if (stick) box.scrollTop = box.scrollHeight;
   };
   // A short timer rather than requestAnimationFrame, which stalls while the tab is in the background.
   const schedule = () => { if (!frame) frame = setTimeout(paint, 40); };
 
-  const id = S.chatId;
   let failure = null;
   try {
     await streamEvents(`/api/chats/${id}/send_stream`, { text, force_scan: forceScan }, (ev) => {
-      if (ev.type === "status") setStatus(ev.text + "…");
-      else if (ev.type === "round") { answer = ""; schedule(); }
-      else if (ev.type === "delta") { answer += ev.text; schedule(); }
+      if (ev.type === "status") setChatStatus(id, ev.text + "…");
+      else if (ev.type === "round") { answer = ""; if (thinking) thinking += "\n\n"; schedule(); }
+      else if (ev.type === "thinking") {
+        if (!thinkingEl) {
+          thinkingEl = el(`<details class="thinking" open><summary>กำลังคิด…</summary><div class="thinking-body"></div></details>`);
+          live.insertBefore(thinkingEl, bubble);
+        }
+        thinking += ev.text;
+        schedule();
+      }
+      else if (ev.type === "delta") {
+        if (thinkingEl && !collapsedThinking) {
+          collapsedThinking = true;
+          thinkingEl.open = false;
+          thinkingEl.querySelector("summary").textContent = "ความคิดของโมเดล";
+        }
+        answer += ev.text; schedule();
+      }
       else if (ev.type === "tool") {
         const bad = String(ev.result).startsWith("ERROR");
         steps.append(el(`<span class="step ${bad ? "err" : "done"}" title="${esc(ev.result)}">${esc(toolLabel(ev.name))}</span>`));
+      } else if (ev.type === "artifact") {
+        const art = ev.artifact;
+        const card = artifactCard(art);
+        if (liveCards.has(art.id)) liveCards.get(art.id).replaceWith(card);
+        else live.querySelector(".art-cards").append(card);
+        liveCards.set(art.id, card);
+        if (S.chatId === id) {
+          // Show it as soon as it exists; after that, follow updates only while the tab is still on it.
+          if (!openedArtifact) { openedArtifact = true; openArtifact(art.id); }
+          else if (S.tab === "artifacts" && (!S.artifact || S.artifact.id === art.id)) openArtifact(art.id);
+        }
       } else if (ev.type === "done") { answer = ev.turn.answer; paint(); }
       else if (ev.type === "error") failure = ev.error;
     });
@@ -582,20 +862,27 @@ async function send() {
     failure = e.message === "Failed to fetch" ? "ติดต่อเซิร์ฟเวอร์ไม่ได้ ตรวจว่ายังรัน server.py อยู่" : e.message;
   }
   if (frame) clearTimeout(frame);
-  S.sending = false;
-  S.sendingChat = null;
-  $("#sendBtn").disabled = false;
+  S.inflight.delete(id);
+  userEl.remove();
+  live.remove();
   if (failure) {
-    userEl.remove();
-    live.remove();
-    if (!input.value) { input.value = text; autoGrow(); }
-    setStatus(failure, true);
-  } else {
-    $("#forceScan").checked = false;
+    // Give the text back in the chat it belongs to; if the user is elsewhere, keep it until they return.
+    S.failed.set(id, { text, error: failure });
+    if (S.chatId === id) restoreFailed();
+  } else if (S.chatId === id) {
     setStatus("");
   }
   await loadChats();
   if (S.chatId === id) await refreshChat();
+}
+
+function restoreFailed() {
+  const f = S.failed.get(S.chatId);
+  if (!f) return;
+  S.failed.delete(S.chatId);
+  const input = $("#input");
+  if (!input.value.trim()) { input.value = f.text; autoGrow(); }
+  setStatus(f.error, true);
 }
 
 let pinTurn = null;
@@ -700,7 +987,7 @@ $("#compressSave").onclick = (ev) => {
 
 // ---------- settings ----------
 
-const SETTING_FIELDS = ["model_summarizer", "model_scanner", "model_main", "compress_at", "round_size", "shard_size",
+const SETTING_FIELDS = ["model_summarizer", "model_scanner", "model_main", "main_effort", "compress_at", "round_size", "shard_size",
   "summary_ttl", "full_ttl", "note_ttl", "state_cap_chars", "tool_limit", "full_char_limit", "max_tool_rounds", "max_usd_per_message"];
 
 async function openSettings() {
@@ -736,7 +1023,10 @@ function updateModelInfo() {
     if (!m) { box.textContent = "ไม่พบ ID นี้ในรายชื่อ"; box.classList.add("warn"); continue; }
     const per1m = (p) => p == null ? "?" : "$" + (Number(p) * 1e6).toFixed(2);
     let txt = `context ${fmtNum(m.context)} · in ${per1m(m.prompt)} / out ${per1m(m.completion)} ต่อล้านโทเคน`;
-    if (name === "model_main" && !m.tools) { txt += " · ⚠ ไม่รองรับ tool calling"; box.classList.add("warn"); }
+    if (name === "model_main") {
+      if (!m.tools) { txt += " · ⚠ ไม่รองรับ tool calling"; box.classList.add("warn"); }
+      txt += m.reasoning ? " · รองรับระดับความคิด" : " · ⚠ ไม่รองรับระดับความคิด";
+    }
     box.textContent = txt;
   }
 }
@@ -770,7 +1060,10 @@ $("#input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
 $("#input").addEventListener("input", autoGrow);
-$("#tabs").addEventListener("click", (e) => { if (e.target.dataset.tab) setTab(e.target.dataset.tab); });
+$("#tabs").addEventListener("click", (e) => {
+  const tab = e.target.closest("[data-tab]")?.dataset.tab;
+  if (tab) setTab(tab);
+});
 $("#togglePanel").onclick = () => setPanel($("#app").classList.contains("panel-closed"));
 $("#closePanel").onclick = () => setPanel(false);
 $("#scrim").onclick = () => setPanel(false, false);

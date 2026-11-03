@@ -18,11 +18,14 @@ from contextlib import contextmanager
 
 import prompts
 
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+
 DEFAULTS = {
     "api_key": "",
     "model_summarizer": "",
     "model_scanner": "",
     "model_main": "",
+    "main_effort": "",
     "compress_at": 25,
     "round_size": 5,
     "shard_size": 250,
@@ -47,7 +50,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS chats(
     id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at REAL NOT NULL,
-    compress_at INTEGER, round_size INTEGER);
+    compress_at INTEGER, round_size INTEGER, main_effort TEXT);
 CREATE TABLE IF NOT EXISTS turns(
     chat_id INTEGER NOT NULL, tid INTEGER NOT NULL,
     user TEXT NOT NULL, answer TEXT NOT NULL,
@@ -62,9 +65,24 @@ CREATE TABLE IF NOT EXISTS state(
 CREATE TABLE IF NOT EXISTS usage(
     id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, tid INTEGER, role TEXT, model TEXT,
     prompt_tokens INTEGER, completion_tokens INTEGER, cost REAL, created_at REAL);
+CREATE TABLE IF NOT EXISTS artifacts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, key TEXT NOT NULL,
+    kind TEXT NOT NULL, language TEXT, created_tid INTEGER NOT NULL,
+    UNIQUE(chat_id, key));
+CREATE TABLE IF NOT EXISTS artifact_versions(
+    artifact_id INTEGER NOT NULL, version INTEGER NOT NULL, title TEXT NOT NULL,
+    content TEXT NOT NULL, tid INTEGER NOT NULL, created_at REAL NOT NULL,
+    PRIMARY KEY(artifact_id, version));
 CREATE INDEX IF NOT EXISTS state_chat ON state(chat_id, active);
 CREATE INDEX IF NOT EXISTS usage_chat ON usage(chat_id);
 """
+
+# Artifacts: standalone pieces the main model writes (pages, documents, code, images). Every edit is a
+# new version. Their content stays out of the chat text, so it never fills layer 1 or the summarizer.
+ARTIFACT_KINDS = ("html", "markdown", "code", "svg")
+ARTIFACT_KEY = re.compile(r"[a-z0-9][a-z0-9-]{0,59}")
+ARTIFACT_MAX_CHARS = 200_000
+ARTIFACT_TOOLS = ("create_artifact", "update_artifact", "read_artifact")
 
 ROLE_NAME = {"main": "ตัวทำงานหลัก", "scan": "ตัววิ่งหาข้อมูล", "summarize": "ตัวสรุป"}
 
@@ -82,7 +100,24 @@ TOOL_STATUS = {
     "record_decision": "กำลังบันทึกข้อตัดสินใจ",
     "add_note": "กำลังจดโน้ต",
     "retire_state": "กำลังจัดชั้น 4",
+    "create_artifact": "กำลังสร้างชิ้นงาน",
+    "update_artifact": "กำลังแก้ชิ้นงาน",
+    "read_artifact": "กำลังอ่านชิ้นงาน",
 }
+
+
+def trace_args(name, args):
+    """Tool args as kept in the turn record. Artifact bodies are replaced by their size, so the
+    summarizer, the inspect tab and the stream never carry a whole page or file again."""
+    if name not in ("create_artifact", "update_artifact"):
+        return args
+    out = dict(args)
+    if isinstance(out.get("content"), str):
+        out["content"] = f"<{len(out['content']):,} chars>"
+    if isinstance(out.get("edits"), list):
+        out["edits"] = [{k: clip(str(e.get(k, "")), 200) for k in ("old", "new")} if isinstance(e, dict) else e
+                        for e in out["edits"]]
+    return out
 
 
 def squash(text):
@@ -157,12 +192,14 @@ class OpenRouter:
         self.api_key = api_key
         self.timeout = timeout
 
-    def _request(self, model, messages, tools, tool_choice, stream=False):
+    def _request(self, model, messages, tools, tool_choice, stream=False, reasoning=None):
         body = {"model": model, "messages": messages, "usage": {"include": True}}
         if tools:
             body["tools"] = tools
         if tool_choice:
             body["tool_choice"] = tool_choice
+        if reasoning is not None:
+            body["reasoning"] = reasoning
         if stream:
             body["stream"] = True
         req = urllib.request.Request(
@@ -183,8 +220,8 @@ class OpenRouter:
         except urllib.error.URLError as e:
             raise LLMError(f"เชื่อมต่อ OpenRouter ไม่ได้: {e.reason}") from None
 
-    def chat(self, model, messages, tools=None, tool_choice=None):
-        with self._request(model, messages, tools, tool_choice) as r:
+    def chat(self, model, messages, tools=None, tool_choice=None, reasoning=None):
+        with self._request(model, messages, tools, tool_choice, reasoning=reasoning) as r:
             data = json.load(r)
         if data.get("error"):
             raise LLMError(f"OpenRouter ({model}): {data['error'].get('message', data['error'])}")
@@ -192,11 +229,14 @@ class OpenRouter:
             raise LLMError(f"OpenRouter ({model}) ไม่ส่งคำตอบกลับมา")
         return data["choices"][0]["message"], data.get("usage") or {}
 
-    def chat_stream(self, model, messages, tools=None, tool_choice=None, on_text=None):
-        """Same result as chat(), but reads server-sent events and calls on_text(piece) as text arrives."""
+    def chat_stream(self, model, messages, tools=None, tool_choice=None, reasoning=None,
+                     on_text=None, on_reasoning=None):
+        """Same result as chat(), but reads server-sent events and calls on_text(piece)/on_reasoning(piece)
+        as plain text and reasoning text arrive. Also rebuilds reasoning_details from the chunks."""
         text, calls, usage, got_choice = [], {}, {}, False
+        reasoning_bits, reasoning_details = [], {}
         try:
-            with self._request(model, messages, tools, tool_choice, stream=True) as r:
+            with self._request(model, messages, tools, tool_choice, stream=True, reasoning=reasoning) as r:
                 for raw in r:
                     line = raw.decode("utf-8", "replace").strip()
                     if not line.startswith("data:"):
@@ -218,6 +258,28 @@ class OpenRouter:
                             text.append(piece)
                             if on_text:
                                 on_text(piece)
+                        rpiece = delta.get("reasoning")
+                        if rpiece:
+                            reasoning_bits.append(rpiece)
+                            if on_reasoning:
+                                on_reasoning(rpiece)
+                        for rd in delta.get("reasoning_details") or []:
+                            idx = rd.get("index", 0)
+                            slot = reasoning_details.get(idx)
+                            payload_key = {"reasoning.text": "text", "reasoning.summary": "summary",
+                                           "reasoning.encrypted": "data"}.get(rd.get("type"), "text")
+                            if slot is None:
+                                slot = dict(rd)
+                                slot[payload_key] = rd.get(payload_key) or ""
+                                reasoning_details[idx] = slot
+                            else:
+                                slot[payload_key] = (slot.get(payload_key) or "") + (rd.get(payload_key) or "")
+                                if rd.get("signature"):
+                                    slot["signature"] = rd["signature"]
+                            if not rpiece and payload_key in ("text", "summary") and rd.get(payload_key):
+                                reasoning_bits.append(rd[payload_key])
+                                if on_reasoning:
+                                    on_reasoning(rd[payload_key])
                         for tc in delta.get("tool_calls") or []:
                             slot = calls.setdefault(tc.get("index", 0), {
                                 "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
@@ -233,6 +295,11 @@ class OpenRouter:
         msg = {"role": "assistant", "content": "".join(text)}
         if calls:
             msg["tool_calls"] = [calls[i] for i in sorted(calls)]
+        if reasoning_details:
+            msg["reasoning_details"] = [reasoning_details[i] for i in sorted(reasoning_details)]
+        joined = "".join(reasoning_bits)
+        if joined:
+            msg["reasoning"] = joined
         return msg, usage
 
 
@@ -274,6 +341,8 @@ class Engine:
                 con.execute("ALTER TABLE chats ADD COLUMN compress_at INTEGER")
             if "round_size" not in cols:
                 con.execute("ALTER TABLE chats ADD COLUMN round_size INTEGER")
+            if "main_effort" not in cols:
+                con.execute("ALTER TABLE chats ADD COLUMN main_effort TEXT")
 
     # ---------- storage helpers ----------
 
@@ -334,6 +403,8 @@ class Engine:
                     v = str(v).strip()
             except (TypeError, ValueError):
                 raise UserError(f"ค่า {k} ไม่ถูกต้อง") from None
+            if k == "main_effort" and v and v not in EFFORTS:
+                raise UserError("ระดับความคิดไม่ถูกต้อง")
             clean[k] = v
         current = self.get_settings()
         merged = {**current, **clean}
@@ -386,7 +457,10 @@ class Engine:
 
     def delete_chat(self, chat_id):
         with self.db() as con:
-            for table, col in (("turns", "chat_id"), ("state", "chat_id"), ("usage", "chat_id"), ("chats", "id")):
+            con.execute("DELETE FROM artifact_versions WHERE artifact_id IN "
+                        "(SELECT id FROM artifacts WHERE chat_id = ?)", (chat_id,))
+            for table, col in (("turns", "chat_id"), ("state", "chat_id"), ("usage", "chat_id"),
+                               ("artifacts", "chat_id"), ("chats", "id")):
                 con.execute(f"DELETE FROM {table} WHERE {col} = ?", (chat_id,))
 
     def _require_chat(self, con, chat_id):
@@ -427,11 +501,30 @@ class Engine:
         with self.db() as con:
             return self._compression(con, chat_id, self.get_settings())
 
+    def _effort(self, con, chat_id, settings):
+        """Effective reasoning effort for one chat's main model: "" or a value in EFFORTS.
+
+        The chat's override column is NULL (use global), "" (explicitly model default) or a level.
+        """
+        row = con.execute("SELECT main_effort FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        custom = row["main_effort"] if row else None
+        value = custom if custom is not None else settings["main_effort"]
+        return {"value": value, "custom": custom, "default": settings["main_effort"]}
+
+    def set_effort(self, chat_id, effort):
+        if effort is not None and effort != "" and effort not in EFFORTS:
+            raise UserError("ระดับความคิดไม่ถูกต้อง")
+        with self.db() as con:
+            self._require_chat(con, chat_id)
+            con.execute("UPDATE chats SET main_effort = ? WHERE id = ?", (effort, chat_id))
+            return self._effort(con, chat_id, self.get_settings())
+
     def get_chat(self, chat_id):
         s = self.get_settings()
         with self.db() as con:
             chat = dict(self._require_chat(con, chat_id))
             comp = self._compression(con, chat_id, s)
+            effort = self._effort(con, chat_id, s)
             turns = []
             for r in con.execute("SELECT * FROM turns WHERE chat_id = ? ORDER BY tid", (chat_id,)):
                 turns.append({
@@ -447,6 +540,7 @@ class Engine:
                 "FROM usage WHERE chat_id = ? GROUP BY role", (chat_id,))]
             cur = (turns[-1]["tid"] if turns else 0) + 1
             state_text = self._render_state(con, chat_id, cur, s, [])
+            artifacts = self._artifact_list(con, chat_id)
         live = [t["tid"] for t in turns if t["summary"] is None]
         chat.update({
             "turns": turns,
@@ -460,6 +554,8 @@ class Engine:
                 "next_summary_at": comp["compress_at"],
             },
             "compression": comp,
+            "effort": effort,
+            "artifacts": artifacts,
             "status": self.status(chat_id),
         })
         return chat
@@ -473,7 +569,130 @@ class Engine:
                 "SELECT * FROM state WHERE chat_id = ? ORDER BY id", (chat_id,))]
             chat["usage"] = [dict(r) for r in con.execute(
                 "SELECT * FROM usage WHERE chat_id = ? ORDER BY id", (chat_id,))]
+            chat["artifacts"] = []
+            for a in con.execute("SELECT * FROM artifacts WHERE chat_id = ? ORDER BY id", (chat_id,)).fetchall():
+                item = dict(a)
+                item["versions"] = [dict(v) for v in con.execute(
+                    "SELECT version, title, content, tid, created_at FROM artifact_versions "
+                    "WHERE artifact_id = ? ORDER BY version", (a["id"],))]
+                chat["artifacts"].append(item)
         return chat
+
+    # ---------- artifacts ----------
+
+    def _artifact_list(self, con, chat_id):
+        """Every artifact of a chat with its latest version's title and size, newest change first."""
+        rows = con.execute("""
+            SELECT a.id, a.key, a.kind, a.language, v.version, v.title, LENGTH(v.content) AS chars,
+                   v.tid AS updated_tid
+            FROM artifacts a
+            JOIN artifact_versions v ON v.artifact_id = a.id
+             AND v.version = (SELECT MAX(version) FROM artifact_versions WHERE artifact_id = a.id)
+            WHERE a.chat_id = ? ORDER BY v.created_at DESC, a.id DESC""", (chat_id,)).fetchall()
+        return [{**dict(r), "versions": r["version"]} for r in rows]
+
+    def list_artifacts(self, chat_id):
+        with self.db() as con:
+            self._require_chat(con, chat_id)
+            return self._artifact_list(con, chat_id)
+
+    def get_artifact(self, chat_id, artifact_id, version=None):
+        with self.db() as con:
+            a = con.execute("SELECT * FROM artifacts WHERE id = ? AND chat_id = ?",
+                            (artifact_id, chat_id)).fetchone()
+            if not a:
+                raise UserError("ไม่พบชิ้นงานนี้")
+            versions = [dict(v) for v in con.execute(
+                "SELECT version, title, tid, created_at, LENGTH(content) AS chars FROM artifact_versions "
+                "WHERE artifact_id = ? ORDER BY version", (artifact_id,))]
+            want = version if version is not None else versions[-1]["version"]
+            v = con.execute("SELECT * FROM artifact_versions WHERE artifact_id = ? AND version = ?",
+                            (artifact_id, want)).fetchone()
+            if not v:
+                raise UserError("ไม่พบชิ้นงานนี้")
+        return {"id": a["id"], "key": a["key"], "title": v["title"], "kind": a["kind"], "language": a["language"],
+                "version": v["version"], "content": v["content"], "versions": versions}
+
+    def _artifact_tool(self, chat_id, cur, name, args, settings, touched):
+        """create_artifact / update_artifact / read_artifact for the main model. Errors go back as text."""
+        key = str(args.get("key") or "").strip()
+        with self.db() as con:
+            a = con.execute("SELECT * FROM artifacts WHERE chat_id = ? AND key = ?", (chat_id, key)).fetchone()
+            latest = None
+            if a:
+                latest = con.execute("SELECT * FROM artifact_versions WHERE artifact_id = ? "
+                                     "ORDER BY version DESC LIMIT 1", (a["id"],)).fetchone()
+
+            if name == "read_artifact":
+                if not a:
+                    return f"ERROR: no artifact with key {key!r}"
+                row = latest
+                if args.get("version") is not None:
+                    row = con.execute("SELECT * FROM artifact_versions WHERE artifact_id = ? AND version = ?",
+                                      (a["id"], int(args["version"]))).fetchone()
+                    if not row:
+                        return f"ERROR: {key} has versions 1–{latest['version']}"
+                return (f"Artifact {key}: {row['title']} [{a['kind']}] v{row['version']} "
+                        f"of {latest['version']}, {len(row['content']):,} chars\n\n"
+                        + clip(row["content"], settings["full_char_limit"]))
+
+            title = str(args.get("title") or "").strip()
+            if title and len(title) > 120:
+                return "ERROR: title must be at most 120 characters"
+
+            if name == "create_artifact":
+                if a:
+                    return f"ERROR: {key} already exists (v{latest['version']}). Use update_artifact to change it."
+                if not ARTIFACT_KEY.fullmatch(key):
+                    return "ERROR: key must be 1-60 chars of a-z, 0-9 and '-', starting with a letter or digit"
+                kind = str(args.get("kind") or "")
+                if kind not in ARTIFACT_KINDS:
+                    return f"ERROR: kind must be one of {', '.join(ARTIFACT_KINDS)}"
+                if not title:
+                    return "ERROR: title is empty"
+                content = args.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    return "ERROR: content is empty"
+                language = str(args.get("language") or "").strip()[:30] or None
+                if len(content) > ARTIFACT_MAX_CHARS:
+                    return f"ERROR: content is {len(content):,} chars; the limit is {ARTIFACT_MAX_CHARS:,}"
+                aid = con.execute("INSERT INTO artifacts(chat_id, key, kind, language, created_tid) "
+                                  "VALUES(?, ?, ?, ?, ?)", (chat_id, key, kind, language, cur)).lastrowid
+                version, kind_out = 1, kind
+            else:  # update_artifact
+                if not a:
+                    return f"ERROR: no artifact with key {key!r}. Use create_artifact first."
+                content, edits = args.get("content"), args.get("edits")
+                if (content is None) == (edits is None):
+                    return "ERROR: pass exactly one of content (full replacement) or edits"
+                if content is not None:
+                    if not isinstance(content, str) or not content.strip():
+                        return "ERROR: content is empty"
+                else:
+                    if not isinstance(edits, list) or not edits:
+                        return "ERROR: edits must be a non-empty list of {old, new}"
+                    content = latest["content"]
+                    for i, e in enumerate(edits):
+                        old = e.get("old") if isinstance(e, dict) else None
+                        if not isinstance(old, str) or not old:
+                            return f"ERROR: edit {i}: old text is empty"
+                        count = content.count(old)
+                        if count != 1:
+                            return (f"ERROR: edit {i}: old text occurs {count} times in v{latest['version']}; "
+                                    "it must occur exactly once. Nothing was saved. Include more context, "
+                                    "or read_artifact first.")
+                        content = content.replace(old, str(e.get("new") or ""), 1)
+                if len(content) > ARTIFACT_MAX_CHARS:
+                    return f"ERROR: content would be {len(content):,} chars; the limit is {ARTIFACT_MAX_CHARS:,}"
+                aid, version, kind_out, language = a["id"], latest["version"] + 1, a["kind"], a["language"]
+                title = title or latest["title"]
+            con.execute("INSERT INTO artifact_versions(artifact_id, version, title, content, tid, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?)", (aid, version, title, content, cur, time.time()))
+        info = {"id": aid, "key": key, "title": title, "kind": kind_out, "language": language, "version": version}
+        touched[aid] = info
+        self._emit(chat_id, {"type": "artifact", "artifact": info})
+        verb = "Created artifact" if version == 1 else "Updated"
+        return f"{verb} {key} v{version} ({len(content):,} chars). It is shown to the user in the artifact panel."
 
     # ---------- layer 4 edits from the user ----------
 
@@ -522,13 +741,18 @@ class Engine:
 
     # ---------- model calls ----------
 
-    def _call(self, chat_id, tid, role, model, messages, meter, settings, on_text=None, **kw):
+    def _call(self, chat_id, tid, role, model, messages, meter, settings, on_text=None,
+              on_reasoning=None, reasoning=None, **kw):
         if not settings["api_key"]:
             raise UserError("ยังไม่ได้ใส่ OpenRouter API key")
         if not model:
             raise UserError(f"ยังไม่ได้เลือกโมเดลของ{ROLE_NAME[role]}")
         client = self.client_factory(settings["api_key"])
+        if reasoning is not None:
+            kw["reasoning"] = reasoning
         if on_text and hasattr(client, "chat_stream"):
+            if on_reasoning is not None:
+                kw["on_reasoning"] = on_reasoning
             msg, usage = client.chat_stream(model, messages, on_text=on_text, **kw)
         else:
             msg, usage = client.chat(model, messages, **kw)
@@ -749,6 +973,11 @@ class Engine:
         if trimmed:
             head.append(f"Layer 4 was over its cap, so the system retired the oldest retrieved items: "
                         f"{', '.join(trimmed)}. Fetch them again if you still need them.")
+        arts = self._artifact_list(con, chat_id)
+        if arts:
+            head.append("Artifacts in this chat (open with read_artifact):\n" + "\n".join(
+                f"- {a['key']}: {a['title']} [{a['kind']}{'/' + a['language'] if a['language'] else ''}] "
+                f"v{a['version']}, {a['chars']:,} chars" for a in arts[:50]))
         titles = {
             "condition": "4a Conditions (the user's own words, always apply)",
             "decision": "4a Decisions (agreed by the user)",
@@ -809,7 +1038,11 @@ class Engine:
             messages.append({"role": "user", "content": f"[ID {cur}] {text}\n\n{state_text}"})
             prompt_chars = sum(len(m["content"]) for m in messages)
 
-            answer, stopped = self._run_main(chat_id, cur, text, messages, settings, meter, trace, scans)
+            with self.db() as con:
+                effort = self._effort(con, chat_id, settings)["value"]
+            touched = {}  # artifact id -> its latest info this turn
+            answer, stopped, reasoning_text = self._run_main(
+                chat_id, cur, text, messages, settings, meter, trace, scans, effort, touched)
             meta = {
                 "scans": scans,
                 "prompt_chars": prompt_chars,
@@ -818,7 +1051,11 @@ class Engine:
                 "cost": meter.cost,
                 "calls": meter.calls,
                 "stopped": stopped,
+                "effort": effort,
+                "artifacts": [{k: a[k] for k in ("id", "key", "title", "kind", "version")} for a in touched.values()],
             }
+            if reasoning_text:
+                meta["reasoning"] = clip(reasoning_text, 20000)
             with self.db() as con:
                 con.execute(
                     "INSERT INTO turns(chat_id, tid, user, answer, tools, meta, summary, created_at) "
@@ -832,47 +1069,60 @@ class Engine:
         self._after_turn(chat_id)
         return {"tid": cur, "user": text, "answer": answer, "tools": trace, "meta": meta, "summary": None}
 
-    def _main_call(self, chat_id, cur, messages, settings, meter, **kw):
+    def _main_call(self, chat_id, cur, messages, settings, meter, effort, **kw):
         """One main-model call. While a listener is attached the reply is streamed as delta events."""
         self._emit(chat_id, {"type": "round"})
         on_text = None
+        on_reasoning = None
         if self._listeners.get(chat_id):
             on_text = lambda piece: self._emit(chat_id, {"type": "delta", "text": piece})  # noqa: E731
+            on_reasoning = lambda piece: self._emit(chat_id, {"type": "thinking", "text": piece})  # noqa: E731
+        reasoning = {"effort": effort} if effort else None
         return self._call(chat_id, cur, "main", settings["model_main"], messages, meter, settings,
-                          on_text=on_text, tools=prompts.TOOLS, **kw)
+                          on_text=on_text, on_reasoning=on_reasoning, reasoning=reasoning,
+                          tools=prompts.TOOLS, **kw)
 
-    def _run_main(self, chat_id, cur, user_text, messages, settings, meter, trace, scans):
-        last_text = ""
+    def _run_main(self, chat_id, cur, user_text, messages, settings, meter, trace, scans, effort, touched):
+        last_text, reasoning_bits = "", []
         for _ in range(settings["max_tool_rounds"]):
             if meter.cost >= settings["max_usd_per_message"]:
                 note = "\n\n⚠️ หยุดเพราะใช้งบถึงเพดานต่อข้อความแล้ว"
                 self._emit(chat_id, {"type": "delta", "text": note})
-                return (last_text + note).strip(), "budget"
+                return (last_text + note).strip(), "budget", "\n\n".join(reasoning_bits)
             self._set_busy(chat_id, "โมเดลหลักกำลังคิด")
-            msg = self._main_call(chat_id, cur, messages, settings, meter)
+            msg = self._main_call(chat_id, cur, messages, settings, meter, effort)
             last_text = message_text(msg)
+            if msg.get("reasoning"):
+                reasoning_bits.append(msg["reasoning"])
             calls = msg.get("tool_calls") or []
             if not calls:
-                return last_text, None
-            messages.append({"role": "assistant", "content": last_text, "tool_calls": calls})
+                return last_text, None, "\n\n".join(reasoning_bits)
+            assistant_msg = {"role": "assistant", "content": last_text, "tool_calls": calls}
+            if msg.get("reasoning_details"):
+                assistant_msg["reasoning_details"] = msg["reasoning_details"]
+            elif msg.get("reasoning"):
+                assistant_msg["reasoning"] = msg["reasoning"]
+            messages.append(assistant_msg)
             for c in calls:
                 name = c.get("function", {}).get("name", "")
                 args = {}
                 try:
                     args = json.loads(c["function"].get("arguments") or "{}")
                     self._set_busy(chat_id, TOOL_STATUS.get(name, f"ใช้เครื่องมือ {name}"))
-                    result = self._tool(chat_id, cur, user_text, name, args, settings, meter, scans)
+                    result = self._tool(chat_id, cur, user_text, name, args, settings, meter, scans, touched)
                 except UserError:
                     raise
                 except Exception as e:  # noqa: BLE001 - reported back to the model as the tool result
                     result = f"ERROR: {e}"
-                entry = {"name": name, "args": args, "result": clip(result, settings["tool_limit"])}
+                entry = {"name": name, "args": trace_args(name, args), "result": clip(result, settings["tool_limit"])}
                 trace.append(entry)
                 self._emit(chat_id, {"type": "tool", **entry})
                 messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "content": result})
         self._set_busy(chat_id, "โมเดลหลักกำลังสรุปคำตอบ")
-        msg = self._main_call(chat_id, cur, messages, settings, meter, tool_choice="none")
-        return message_text(msg), "max_tool_rounds"
+        msg = self._main_call(chat_id, cur, messages, settings, meter, effort, tool_choice="none")
+        if msg.get("reasoning"):
+            reasoning_bits.append(msg["reasoning"])
+        return message_text(msg), "max_tool_rounds", "\n\n".join(reasoning_bits)
 
     # ---------- tools for the main model ----------
 
@@ -883,7 +1133,9 @@ class Engine:
         row = con.execute("SELECT user FROM turns WHERE chat_id = ? AND tid = ?", (chat_id, tid)).fetchone()
         return row["user"] if row else None
 
-    def _tool(self, chat_id, cur, user_text, name, args, settings, meter, scans):
+    def _tool(self, chat_id, cur, user_text, name, args, settings, meter, scans, touched):
+        if name in ARTIFACT_TOOLS:
+            return self._artifact_tool(chat_id, cur, name, args, settings, touched)
         if name == "search_memory":
             query = str(args.get("query") or "").strip()
             if not query:

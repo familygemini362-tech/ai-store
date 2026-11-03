@@ -46,6 +46,7 @@ def fetch_models():
             "prompt": (m.get("pricing") or {}).get("prompt"),
             "completion": (m.get("pricing") or {}).get("completion"),
             "tools": "tools" in (m.get("supported_parameters") or []),
+            "reasoning": "reasoning" in (m.get("supported_parameters") or []),
         } for m in raw]
         _models_cache.update(at=time.time(), data=models)
         return models
@@ -240,6 +241,16 @@ class Handler(BaseHTTPRequestHandler):
         compression = engine.set_compression(chat_id, body.get("compress_at"), body.get("round_size"))
         return {"compression": compression}
 
+    def put_effort(self, body, chat_id):
+        effort = engine.set_effort(chat_id, body.get("effort"))
+        return {"effort": effort}
+
+    def list_artifacts(self, _, chat_id):
+        return engine.list_artifacts(chat_id)
+
+    def get_artifact(self, _, chat_id, artifact_id, version=None):
+        return engine.get_artifact(chat_id, artifact_id, version)
+
     def export(self, _, chat_id):
         data = json.dumps(engine.export_chat(chat_id), ensure_ascii=False, indent=2).encode("utf-8")
         self._send(200, data, "application/json; charset=utf-8",
@@ -262,6 +273,10 @@ ROUTES = [
     ("POST", r"/api/chats/(\d+)/scan", Handler.scan),
     ("PUT", r"/api/chats/(\d+)/summaries/(\d+)", Handler.put_summary),
     ("PUT", r"/api/chats/(\d+)/compression", Handler.put_compression),
+    ("PUT", r"/api/chats/(\d+)/effort", Handler.put_effort),
+    ("GET", r"/api/chats/(\d+)/artifacts", Handler.list_artifacts),
+    ("GET", r"/api/chats/(\d+)/artifacts/(\d+)", Handler.get_artifact),
+    ("GET", r"/api/chats/(\d+)/artifacts/(\d+)/versions/(\d+)", Handler.get_artifact),
     ("POST", r"/api/chats/(\d+)/state", Handler.add_state),
     ("PATCH", r"/api/chats/(\d+)/state/(\d+)", Handler.patch_state),
     ("GET", r"/api/chats/(\d+)/export", Handler.export),
