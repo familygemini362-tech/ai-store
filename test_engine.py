@@ -60,7 +60,7 @@ class EngineTest(unittest.TestCase):
         self.engine = Engine(Path(self.tmp.name) / "t.db", client_factory=self.fake, summarize_async=False)
         self.engine.save_settings({
             "api_key": "test-key", "model_summarizer": "s", "model_scanner": "c", "model_main": "m",
-            "live_turns": 4, "round_size": 2, "shard_size": 2,
+            "compress_at": 6, "round_size": 2, "shard_size": 2,
         })
         self.chat = self.engine.create_chat()
 
@@ -74,7 +74,7 @@ class EngineTest(unittest.TestCase):
     def test_summarizes_oldest_round_as_separate_ids(self):
         self.fill(["apple", "banana", "cherry", "durian", "elder"])
         chat = self.engine.get_chat(self.chat)
-        self.assertEqual(chat["layers"]["archived"], 0)  # 5 < live_turns + round_size
+        self.assertEqual(chat["layers"]["archived"], 0)  # 5 < compress_at (6)
         self.fill(["fig"])
         chat = self.engine.get_chat(self.chat)
         self.assertEqual(chat["layers"]["archived"], 2)
@@ -185,6 +185,54 @@ class EngineTest(unittest.TestCase):
         self.engine.save_settings({"model_main": ""})
         with self.assertRaises(UserError):
             self.engine.send(self.chat, "hi")
+
+    def test_per_chat_override_compresses_independently(self):
+        chat2 = self.engine.create_chat()
+        self.engine.set_compression(self.chat, 4, 1)  # compress sooner, one at a time
+        self.fill(["a", "b", "c", "d"])
+        for t in ["a", "b", "c", "d"]:
+            self.engine.send(chat2, t)  # chat2 keeps using the global settings (6 / 2)
+        c1 = self.engine.get_chat(self.chat)
+        c2 = self.engine.get_chat(chat2)
+        self.assertEqual(c1["layers"]["archived"], 1)
+        self.assertEqual(c1["layers"]["live"], 3)
+        self.assertEqual(c2["layers"]["archived"], 0)
+
+    def test_clearing_override_reverts_to_global(self):
+        self.engine.set_compression(self.chat, 3, 1)
+        comp = self.engine.get_chat(self.chat)["compression"]
+        self.assertEqual((comp["compress_at"], comp["round_size"]), (3, 1))
+        self.engine.set_compression(self.chat, None, None)
+        comp = self.engine.get_chat(self.chat)["compression"]
+        self.assertEqual((comp["compress_at"], comp["round_size"]), (6, 2))
+        self.assertIsNone(comp["custom"]["compress_at"])
+        self.assertIsNone(comp["custom"]["round_size"])
+
+    def test_compression_validation_rejects_bad_values(self):
+        with self.assertRaises(UserError):
+            self.engine.set_compression(self.chat, 3, 3)  # round_size must be < compress_at
+        with self.assertRaises(UserError):
+            self.engine.set_compression(self.chat, 1, 1)  # compress_at must be >= 2
+        with self.assertRaises(UserError):
+            self.engine.save_settings({"round_size": 10})  # >= current compress_at (6)
+        with self.assertRaises(UserError):
+            self.engine.save_settings({"compress_at": 1})
+
+    def test_live_turns_migration(self):
+        with self.engine.db() as con:
+            con.execute("DELETE FROM settings WHERE key IN ('compress_at', 'round_size', 'live_turns')")
+            con.execute("INSERT INTO settings(key, value) VALUES('live_turns', '10')")
+            con.execute("INSERT INTO settings(key, value) VALUES('round_size', '3')")
+        self.assertEqual(self.engine.get_settings()["compress_at"], 13)
+
+    def test_get_chat_compression_shape(self):
+        chat = self.engine.get_chat(self.chat)
+        self.assertEqual(chat["compression"], {
+            "compress_at": 6, "round_size": 2,
+            "custom": {"compress_at": None, "round_size": None},
+            "default": {"compress_at": 6, "round_size": 2},
+        })
+        self.assertEqual(chat["layers"]["next_summary_at"], 6)
 
 
 if __name__ == "__main__":

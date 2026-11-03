@@ -201,6 +201,10 @@ class Handler(BaseHTTPRequestHandler):
         engine.update_state(chat_id, item_id, body.get("text"), body.get("active"))
         return {"ok": True}
 
+    def put_compression(self, body, chat_id):
+        compression = engine.set_compression(chat_id, body.get("compress_at"), body.get("round_size"))
+        return {"compression": compression}
+
     def export(self, _, chat_id):
         data = json.dumps(engine.export_chat(chat_id), ensure_ascii=False, indent=2).encode("utf-8")
         self._send(200, data, "application/json; charset=utf-8",
@@ -221,6 +225,7 @@ ROUTES = [
     ("POST", r"/api/chats/(\d+)/summarize", Handler.summarize),
     ("POST", r"/api/chats/(\d+)/scan", Handler.scan),
     ("PUT", r"/api/chats/(\d+)/summaries/(\d+)", Handler.put_summary),
+    ("PUT", r"/api/chats/(\d+)/compression", Handler.put_compression),
     ("POST", r"/api/chats/(\d+)/state", Handler.add_state),
     ("PATCH", r"/api/chats/(\d+)/state/(\d+)", Handler.patch_state),
     ("GET", r"/api/chats/(\d+)/export", Handler.export),

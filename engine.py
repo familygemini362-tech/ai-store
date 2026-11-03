@@ -23,7 +23,7 @@ DEFAULTS = {
     "model_summarizer": "",
     "model_scanner": "",
     "model_main": "",
-    "live_turns": 20,
+    "compress_at": 25,
     "round_size": 5,
     "shard_size": 250,
     "summary_ttl": 6,
@@ -46,7 +46,8 @@ MEMORY_HINT = re.compile(
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS chats(
-    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at REAL NOT NULL);
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at REAL NOT NULL,
+    compress_at INTEGER, round_size INTEGER);
 CREATE TABLE IF NOT EXISTS turns(
     chat_id INTEGER NOT NULL, tid INTEGER NOT NULL,
     user TEXT NOT NULL, answer TEXT NOT NULL,
@@ -103,6 +104,23 @@ def parse_json(text):
     if start < 0 or end < start:
         raise ValueError("ไม่พบ JSON ในคำตอบ")
     return json.loads(text[start:end + 1])
+
+
+def parse_count(v, name, min_val):
+    """Parse a per-chat compression override: None/"" clears it, otherwise a plain int >= min_val."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        raise UserError(f"ค่า {name} ไม่ถูกต้อง")
+    if isinstance(v, int):
+        n = v
+    elif isinstance(v, str) and re.fullmatch(r"-?\d+", v.strip()):
+        n = int(v.strip())
+    else:
+        raise UserError(f"ค่า {name} ไม่ถูกต้อง")
+    if n < min_val:
+        raise UserError(f"ค่า {name} ไม่ถูกต้อง")
+    return n
 
 
 def format_summary(tid, summary):
@@ -182,6 +200,12 @@ class Engine:
         self._errors = {}
         with self.db() as con:
             con.executescript(SCHEMA)
+            # Migration for DBs created before per-chat compression overrides existed.
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(chats)")}
+            if "compress_at" not in cols:
+                con.execute("ALTER TABLE chats ADD COLUMN compress_at INTEGER")
+            if "round_size" not in cols:
+                con.execute("ALTER TABLE chats ADD COLUMN round_size INTEGER")
 
     # ---------- storage helpers ----------
 
@@ -203,9 +227,17 @@ class Engine:
     def get_settings(self):
         s = dict(DEFAULTS)
         with self.db() as con:
-            for r in con.execute("SELECT key, value FROM settings"):
-                if r["key"] in s:
-                    s[r["key"]] = json.loads(r["value"])
+            rows = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM settings")}
+        for k, v in rows.items():
+            if k in s:
+                s[k] = json.loads(v)
+        # Migration: old DBs stored "live_turns" instead of "compress_at". Translate it once;
+        # the stale live_turns row itself is just ignored above (it is not in DEFAULTS anymore).
+        if "compress_at" not in rows and "live_turns" in rows:
+            try:
+                s["compress_at"] = int(json.loads(rows["live_turns"])) + s["round_size"]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
         return s
 
     def public_settings(self):
@@ -228,13 +260,17 @@ class Engine:
                         raise ValueError
                 elif isinstance(default, int):
                     v = int(v)
-                    if v < 1:
+                    if v < 1 or (k == "compress_at" and v < 2):
                         raise ValueError
                 else:
                     v = str(v).strip()
             except (TypeError, ValueError):
                 raise UserError(f"ค่า {k} ไม่ถูกต้อง") from None
             clean[k] = v
+        current = self.get_settings()
+        merged = {**current, **clean}
+        if merged["round_size"] >= merged["compress_at"]:
+            raise UserError("บีบอัดครั้งละกี่เทิร์นต้องน้อยกว่าจำนวนเทิร์นที่เริ่มบีบอัด")
         with self.db() as con:
             for k, v in clean.items():
                 con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (k, json.dumps(v)))
@@ -284,10 +320,43 @@ class Engine:
             raise UserError("ไม่พบแชตนี้")
         return row
 
+    def _compression(self, con, chat_id, settings):
+        """Effective compress_at/round_size for one chat: global settings with that chat's overrides."""
+        row = con.execute("SELECT compress_at, round_size FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        custom_compress_at = row["compress_at"] if row else None
+        custom_round_size = row["round_size"] if row else None
+        compress_at = custom_compress_at if custom_compress_at is not None else settings["compress_at"]
+        round_size = custom_round_size if custom_round_size is not None else settings["round_size"]
+        if round_size >= compress_at:  # defaults may have changed since the override was saved
+            round_size = compress_at - 1
+        return {
+            "compress_at": compress_at,
+            "round_size": round_size,
+            "custom": {"compress_at": custom_compress_at, "round_size": custom_round_size},
+            "default": {"compress_at": settings["compress_at"], "round_size": settings["round_size"]},
+        }
+
+    def set_compression(self, chat_id, compress_at, round_size):
+        new_compress_at = parse_count(compress_at, "compress_at", 2)
+        new_round_size = parse_count(round_size, "round_size", 1)
+        s = self.get_settings()
+        eff_compress_at = new_compress_at if new_compress_at is not None else s["compress_at"]
+        eff_round_size = new_round_size if new_round_size is not None else s["round_size"]
+        if eff_round_size >= eff_compress_at:
+            raise UserError("บีบอัดครั้งละกี่เทิร์นต้องน้อยกว่าจำนวนเทิร์นที่เริ่มบีบอัด")
+        with self.db() as con:
+            self._require_chat(con, chat_id)
+            con.execute("UPDATE chats SET compress_at = ?, round_size = ? WHERE id = ?",
+                        (new_compress_at, new_round_size, chat_id))
+        self._after_turn(chat_id)  # lowering the threshold may mean we can compress right away
+        with self.db() as con:
+            return self._compression(con, chat_id, self.get_settings())
+
     def get_chat(self, chat_id):
         s = self.get_settings()
         with self.db() as con:
             chat = dict(self._require_chat(con, chat_id))
+            comp = self._compression(con, chat_id, s)
             turns = []
             for r in con.execute("SELECT * FROM turns WHERE chat_id = ? ORDER BY tid", (chat_id,)):
                 turns.append({
@@ -313,8 +382,9 @@ class Engine:
                 "archived": len(turns) - len(live),
                 "state_chars": len(state_text),
                 "state_cap": s["state_cap_chars"],
-                "next_summary_at": s["live_turns"] + s["round_size"],
+                "next_summary_at": comp["compress_at"],
             },
+            "compression": comp,
             "status": self.status(chat_id),
         })
         return chat
@@ -395,7 +465,8 @@ class Engine:
     # ---------- layer 2: summarizer ----------
 
     def summarize_pending(self, chat_id, force=False):
-        """Summarize the oldest round while layer 1 holds live_turns + round_size turns or more.
+        """Summarize the oldest round while layer 1 holds compress_at turns or more (global default,
+        overridable per chat; see _compression).
 
         force=True summarizes one round now even below the threshold (for testing by hand).
         """
@@ -408,14 +479,15 @@ class Engine:
             while True:
                 s = self.get_settings()
                 with self.db() as con:
+                    comp = self._compression(con, chat_id, s)
                     pending = con.execute(
                         "SELECT tid, user, answer, tools FROM turns WHERE chat_id = ? AND summary IS NULL ORDER BY tid",
                         (chat_id,)).fetchall()
                 if not pending:
                     break
-                if len(pending) < s["live_turns"] + s["round_size"] and not (force and done == 0):
+                if len(pending) < comp["compress_at"] and not (force and done == 0):
                     break
-                batch = pending[:s["round_size"]]
+                batch = pending[:comp["round_size"]]
                 self._summarize_round(chat_id, batch, pending[len(batch)] if len(pending) > len(batch) else None, s)
                 done += len(batch)
         except Exception as e:  # noqa: BLE001 - surfaced through status()

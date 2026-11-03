@@ -39,7 +39,7 @@
     <footer class="composer" id="composer" hidden>
       <div class="status" id="status"></div>
       <div class="compose-row">
-        <textarea id="input" rows="3" placeholder="พิมพ์ข้อความ… (Ctrl+Enter เพื่อส่ง)"></textarea>
+        <textarea id="input" rows="3" placeholder="พิมพ์ข้อความ… (Enter เพื่อส่ง, Shift+Enter ขึ้นบรรทัดใหม่)"></textarea>
         <button id="sendBtn" class="primary">ส่ง</button>
       </div>
       <label class="check"><input type="checkbox" id="forceScan"> บังคับสแกนความจำก่อนตอบ</label>
@@ -85,9 +85,10 @@
 
     <details>
       <summary>ค่าระบบ</summary>
+      <p class="muted small">ค่าเหล่านี้คือค่าเริ่มต้นของทุกแชต แต่ละแชตตั้งค่าเฉพาะของตัวเองได้จากปุ่ม "ปรับ" ที่หัวแชต</p>
       <div class="grid">
-        <label>เทิร์นในชั้น 1 <input type="number" min="1" name="live_turns"></label>
-        <label>ID ต่อรอบสรุป <input type="number" min="1" name="round_size"></label>
+        <label>เริ่มบีบอัดเมื่อชั้น 1 ครบ (เทิร์น) <input type="number" min="2" name="compress_at"></label>
+        <label>บีบอัดครั้งละ (เทิร์น) <input type="number" min="1" name="round_size"></label>
         <label>ID ต่อชุดสแกน <input type="number" min="1" name="shard_size"></label>
         <label>อายุสรุปในชั้น 4 (เทิร์น) <input type="number" min="1" name="summary_ttl"></label>
         <label>อายุข้อความเต็มในชั้น 4 <input type="number" min="1" name="full_ttl"></label>
@@ -117,6 +118,24 @@
       <span class="error" id="pinError"></span>
       <button value="cancel" formnovalidate>ยกเลิก</button>
       <button id="pinSave" class="primary" value="default">ปัก</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="compressDialog">
+  <form method="dialog" id="compressForm">
+    <h2>การบีบอัดของแชตนี้</h2>
+    <p class="muted">เว้นว่างไว้เพื่อใช้ค่าเริ่มต้นของระบบ ตั้งเฉพาะแชตนี้ได้ถ้าต้องการค่าต่างจากแชตอื่น</p>
+    <div class="grid">
+      <label>เริ่มบีบอัดเมื่อชั้น 1 ครบ (เทิร์น) <input type="number" min="2" step="1" id="compressAtInput" name="compress_at"></label>
+      <label>บีบอัดครั้งละ (เทิร์น) <input type="number" min="1" step="1" id="compressRoundInput" name="round_size"></label>
+    </div>
+    <p class="muted small" id="compressHint"></p>
+    <div class="dialog-actions">
+      <span class="error" id="compressError"></span>
+      <button type="button" id="compressCancel">ยกเลิก</button>
+      <button type="button" id="compressUseDefault">ใช้ค่าเริ่มต้น</button>
+      <button id="compressSave" class="primary" value="default">บันทึก</button>
     </div>
   </form>
 </dialog>

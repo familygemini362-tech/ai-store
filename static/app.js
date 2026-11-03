@@ -158,11 +158,23 @@ function renderHeader() {
   $("#chatTitle").textContent = c.title;
   const cost = c.usage.reduce((a, u) => a + (u.cost || 0), 0);
   const over = L.state_chars > L.state_cap;
+  const comp = c.compression;
+  let compressSpan;
+  if (comp) {
+    const isCustom = comp.custom && (comp.custom.compress_at != null || comp.custom.round_size != null);
+    compressSpan = `<span>ชั้น 1: <b>${L.live}</b> เทิร์น · บีบอัดเมื่อครบ ${comp.compress_at} ครั้งละ ${comp.round_size}
+      <span class="muted small">${isCustom ? "ตั้งเฉพาะแชตนี้" : "ค่าเริ่มต้น"}</span>
+      <button class="link" id="adjustCompress">ปรับ</button></span>`;
+  } else {
+    compressSpan = `<span>ชั้น 1: <b>${L.live}</b> เทิร์น (สรุปเมื่อครบ ${L.next_summary_at})</span>`;
+  }
   $("#layerBar").innerHTML = `
-    <span>ชั้น 1: <b>${L.live}</b> เทิร์น (สรุปเมื่อครบ ${L.next_summary_at})</span>
+    ${compressSpan}
     <span>ชั้น 2–3: <b>${L.archived}</b> ID</span>
     <span class="${over ? "over" : ""}">ชั้น 4: <b>${fmtNum(L.state_chars)}</b> / ${fmtNum(L.state_cap)} ตัวอักษร</span>
     <span>ค่าใช้จ่ายรวม: <b>${fmtUsd(cost)}</b></span>`;
+  const adjustBtn = $("#adjustCompress");
+  if (adjustBtn) adjustBtn.onclick = openCompressDialog;
 }
 
 function renderMessages() {
@@ -460,9 +472,90 @@ $("#pinSave").onclick = async (ev) => {
   } catch (e) { $("#pinError").textContent = e.message; }
 };
 
+// ---------- compression dialog ----------
+
+function openCompressDialog() {
+  const c = S.chat;
+  const comp = c.compression;
+  if (!comp) return;
+  const atInput = $("#compressAtInput");
+  const roundInput = $("#compressRoundInput");
+  atInput.value = comp.custom.compress_at ?? "";
+  roundInput.value = comp.custom.round_size ?? "";
+  atInput.placeholder = `ค่าเริ่มต้น ${comp.default.compress_at}`;
+  roundInput.placeholder = `ค่าเริ่มต้น ${comp.default.round_size}`;
+  $("#compressError").textContent = "";
+  updateCompressHint();
+  $("#compressDialog").showModal();
+}
+
+function updateCompressHint() {
+  const comp = S.chat?.compression;
+  if (!comp) return;
+  const atInput = $("#compressAtInput");
+  const roundInput = $("#compressRoundInput");
+  const at = atInput.value.trim() ? Number(atInput.value) : comp.default.compress_at;
+  const round = roundInput.value.trim() ? Number(roundInput.value) : comp.default.round_size;
+  const err = $("#compressError");
+  const bad = compressProblem(at, round);
+  if (bad) {
+    $("#compressHint").textContent = "";
+    err.textContent = bad;
+  } else {
+    err.textContent = "";
+    $("#compressHint").textContent = `หลังบีบอัด ชั้น 1 จะเหลือ ${at - round} เทิร์น`;
+  }
+}
+
+function compressProblem(at, round) {
+  if (!Number.isInteger(at) || !Number.isInteger(round)) return "ใส่เป็นจำนวนเต็มเท่านั้น";
+  if (at < 2 || round < 1) return "เริ่มบีบอัดต้องอย่างน้อย 2 และบีบอัดครั้งละอย่างน้อย 1";
+  if (round >= at) return "บีบอัดครั้งละต้องน้อยกว่าเริ่มบีบอัดเมื่อครบ";
+  return "";
+}
+
+$("#compressAtInput").addEventListener("input", updateCompressHint);
+$("#compressRoundInput").addEventListener("input", updateCompressHint);
+
+async function saveCompression(body) {
+  const buttons = $("#compressDialog").querySelectorAll("button");
+  buttons.forEach((b) => { b.disabled = true; });
+  try {
+    await api("PUT", `/api/chats/${S.chatId}/compression`, body);
+    $("#compressDialog").close();
+    S.chat = await api("GET", `/api/chats/${S.chatId}`);
+    render();
+    watchSummarizer();
+  } catch (e) { $("#compressError").textContent = e.message; }
+  finally { buttons.forEach((b) => { b.disabled = false; }); }
+}
+
+$("#compressCancel").onclick = () => $("#compressDialog").close();
+
+$("#compressUseDefault").onclick = () => saveCompression({ compress_at: null, round_size: null });
+
+// Enter in a number field submits the form; route it through the same save path.
+$("#compressForm").addEventListener("submit", (ev) => { ev.preventDefault(); $("#compressSave").click(); });
+
+$("#compressSave").onclick = (ev) => {
+  ev.preventDefault();
+  if ($("#compressSave").disabled) return;
+  const atInput = $("#compressAtInput");
+  const roundInput = $("#compressRoundInput");
+  const comp = S.chat.compression;
+  const at = atInput.value.trim() ? Number(atInput.value) : comp.default.compress_at;
+  const round = roundInput.value.trim() ? Number(roundInput.value) : comp.default.round_size;
+  const bad = compressProblem(at, round);
+  if (bad) { $("#compressError").textContent = bad; return; }
+  saveCompression({
+    compress_at: atInput.value.trim() ? Number(atInput.value) : null,
+    round_size: roundInput.value.trim() ? Number(roundInput.value) : null,
+  });
+};
+
 // ---------- settings ----------
 
-const SETTING_FIELDS = ["model_summarizer", "model_scanner", "model_main", "live_turns", "round_size", "shard_size",
+const SETTING_FIELDS = ["model_summarizer", "model_scanner", "model_main", "compress_at", "round_size", "shard_size",
   "summary_ttl", "full_ttl", "note_ttl", "state_cap_chars", "tool_limit", "full_char_limit", "max_tool_rounds", "max_usd_per_message"];
 
 async function openSettings() {
@@ -529,7 +622,7 @@ $("#newChat").onclick = async () => {
 };
 $("#sendBtn").onclick = send;
 $("#input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
 $("#tabs").addEventListener("click", (e) => { if (e.target.dataset.tab) setTab(e.target.dataset.tab); });
 $("#chatTitle").onclick = async () => {
