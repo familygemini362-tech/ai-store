@@ -50,6 +50,8 @@
 }
 
 * { box-sizing: border-box; }
+/* Class rules like .effort { display: inline-flex } would otherwise override the hidden attribute. */
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
   background: var(--bg);
