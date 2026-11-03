@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4-Layer Memory</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">ความจำ 4 ชั้น</div>
+    <button id="newChat" class="primary wide">+ แชตใหม่</button>
+    <ul id="chatList" class="chat-list"></ul>
+    <button id="openSettings" class="wide">⚙ ตั้งค่า key และโมเดล</button>
+    <div id="setupHint" class="hint"></div>
+  </aside>
+
+  <main class="main">
+    <header class="chat-head" id="chatHead" hidden>
+      <div class="title-row">
+        <h1 id="chatTitle" title="คลิกเพื่อเปลี่ยนชื่อ"></h1>
+        <div class="head-actions">
+          <button id="forceSummarize" title="สรุปรอบที่เก่าที่สุดทันที แม้ยังไม่ถึงเกณฑ์">สรุปรอบถัดไป</button>
+          <button id="exportChat">ส่งออก JSON</button>
+          <button id="deleteChat" class="danger">ลบแชต</button>
+        </div>
+      </div>
+      <div class="layer-bar" id="layerBar"></div>
+    </header>
+
+    <section class="messages" id="messages">
+      <div class="empty" id="emptyState">
+        <h2>เริ่มจากตั้งค่า แล้วสร้างแชตใหม่</h2>
+        <p>ใส่ OpenRouter key และเลือกโมเดล 3 ตัว: ตัวสรุป ตัววิ่งหาข้อมูล และตัวทำงานหลัก</p>
+      </div>
+    </section>
+
+    <footer class="composer" id="composer" hidden>
+      <div class="status" id="status"></div>
+      <div class="compose-row">
+        <textarea id="input" rows="3" placeholder="พิมพ์ข้อความ… (Ctrl+Enter เพื่อส่ง)"></textarea>
+        <button id="sendBtn" class="primary">ส่ง</button>
+      </div>
+      <label class="check"><input type="checkbox" id="forceScan"> บังคับสแกนความจำก่อนตอบ</label>
+    </footer>
+  </main>
+
+  <aside class="panel" id="panel" hidden>
+    <nav class="tabs" id="tabs">
+      <button data-tab="state" class="active">ชั้น 4</button>
+      <button data-tab="summaries">ชั้น 2</button>
+      <button data-tab="inspect">ตรวจสอบ</button>
+      <button data-tab="scan">ทดสอบสแกน</button>
+    </nav>
+    <div class="panel-body" id="panelBody"></div>
+  </aside>
+</div>
+
+<dialog id="settingsDialog">
+  <form method="dialog" id="settingsForm">
+    <h2>ตั้งค่า</h2>
+    <p class="muted">ทุกอย่างเก็บในเครื่องนี้ที่ <code>data/memory.db</code> key ส่งไปที่ OpenRouter เท่านั้น</p>
+
+    <label>OpenRouter API key
+      <input type="password" name="api_key" id="apiKey" autocomplete="off" placeholder="sk-or-...">
+    </label>
+    <div class="muted small" id="keyState"></div>
+
+    <fieldset>
+      <legend>โมเดล <span class="muted small" id="modelsState"></span></legend>
+      <label>ตัวสรุป (สรุปเทิร์นเก่าเป็นราย ID)
+        <input name="model_summarizer" list="modelOptions" placeholder="เช่น anthropic/claude-haiku-5.5">
+      </label>
+      <div class="model-info" data-for="model_summarizer"></div>
+      <label>ตัววิ่งหาข้อมูล (อ่านสรุปทุก ID แล้วเลือก)
+        <input name="model_scanner" list="modelOptions" placeholder="ควรเป็นโมเดลราคาถูก">
+      </label>
+      <div class="model-info" data-for="model_scanner"></div>
+      <label>ตัวทำงานหลัก (คุยกับผู้ใช้ ต้องรองรับ tool calling)
+        <input name="model_main" list="modelOptions">
+      </label>
+      <div class="model-info" data-for="model_main"></div>
+    </fieldset>
+
+    <details>
+      <summary>ค่าระบบ</summary>
+      <div class="grid">
+        <label>เทิร์นในชั้น 1 <input type="number" min="1" name="live_turns"></label>
+        <label>ID ต่อรอบสรุป <input type="number" min="1" name="round_size"></label>
+        <label>ID ต่อชุดสแกน <input type="number" min="1" name="shard_size"></label>
+        <label>อายุสรุปในชั้น 4 (เทิร์น) <input type="number" min="1" name="summary_ttl"></label>
+        <label>อายุข้อความเต็มในชั้น 4 <input type="number" min="1" name="full_ttl"></label>
+        <label>อายุโน้ตเริ่มต้น <input type="number" min="1" name="note_ttl"></label>
+        <label>เพดานชั้น 4 (ตัวอักษร) <input type="number" min="1" name="state_cap_chars"></label>
+        <label>ตัดผล tool ที่ส่งให้ตัวสรุป <input type="number" min="1" name="tool_limit"></label>
+        <label>ตัดข้อความเต็มต่อ ID <input type="number" min="1" name="full_char_limit"></label>
+        <label>รอบ tool สูงสุดต่อข้อความ <input type="number" min="1" name="max_tool_rounds"></label>
+        <label>เพดานงบต่อข้อความ (USD) <input type="number" min="0.001" step="0.001" name="max_usd_per_message"></label>
+      </div>
+    </details>
+
+    <div class="dialog-actions">
+      <span class="error" id="settingsError"></span>
+      <button value="cancel" formnovalidate>ยกเลิก</button>
+      <button id="saveSettings" class="primary" value="default">บันทึก</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="pinDialog">
+  <form method="dialog" id="pinForm">
+    <h2>ปักเป็นเงื่อนไข (condition)</h2>
+    <p class="muted">ต้องเป็นคำของคุณตรงตัว ลบส่วนที่ไม่ต้องการออกได้ แต่ห้ามแก้คำ</p>
+    <textarea id="pinText" rows="6"></textarea>
+    <div class="dialog-actions">
+      <span class="error" id="pinError"></span>
+      <button value="cancel" formnovalidate>ยกเลิก</button>
+      <button id="pinSave" class="primary" value="default">ปัก</button>
+    </div>
+  </form>
+</dialog>
+
+<datalist id="modelOptions"></datalist>
+<script src="app.js"></script>
+</body>
+</html>
