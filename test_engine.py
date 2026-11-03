@@ -142,7 +142,7 @@ class EngineTest(unittest.TestCase):
         turn = self.engine.send(self.chat, "note it again")
         self.assertIn("Added", turn["tools"][0]["result"])
 
-    def test_condition_must_be_verbatim_and_model_cannot_retire_it(self):
+    def test_condition_must_be_verbatim_and_model_cannot_retire_it_unasked(self):
         self.fill(["ห้ามใช้ wallet ในการคืนเงิน และต้องคืนภายใน 7 วัน"])
         with self.assertRaises(UserError):
             self.engine.add_state(self.chat, "condition", "ห้ามใช้กระเป๋าเงิน", source_tid=1)
@@ -150,8 +150,79 @@ class EngineTest(unittest.TestCase):
         cond = self.engine.get_chat(self.chat)["state"][0]
         self.fake.main_script = [tool_call("retire_state", item_id=cond["id"], reason="x"), {"content": "done"}]
         turn = self.engine.send(self.chat, "clean up")
-        self.assertIn("only be removed by the user", turn["tools"][0]["result"])
+        self.assertIn("is in 4a", turn["tools"][0]["result"])
+        # A quote that is not in the user's current message does not count as the user asking.
+        self.fake.main_script = [tool_call("retire_state", item_id=cond["id"], reason="x",
+                                           user_quote="ยกเลิกเงื่อนไข wallet"), {"content": "done"}]
+        turn = self.engine.send(self.chat, "tidy layer 4")
+        self.assertIn("not a verbatim quote", turn["tools"][0]["result"])
         self.assertEqual(len(self.engine.get_chat(self.chat)["state"]), 1)
+
+    def test_model_pins_condition_from_users_exact_words(self):
+        self.fake.main_script = [
+            tool_call("pin_condition", text="ตอบเป็นภาษาไทยเสมอ", source_id=1),
+            tool_call("pin_condition", text="always answer in Thai", source_id=1),  # paraphrase/translation
+            tool_call("pin_condition", text="ตอบเป็นภาษาไทยเสมอ", source_id=1),  # duplicate
+            {"content": "ok"},
+        ]
+        turn = self.engine.send(self.chat, "ช่วยวางแผนทริป  ตอบเป็นภาษาไทยเสมอ นะ")
+        results = [t["result"] for t in turn["tools"]]
+        self.assertTrue(results[0].startswith("Pinned as [C"))
+        self.assertIn("not a verbatim quote", results[1])
+        self.assertIn("Already pinned", results[2])
+        state = self.engine.get_chat(self.chat)["state"]
+        self.assertEqual([(s["kind"], s["text"], s["origin"]) for s in state],
+                         [("condition", "ตอบเป็นภาษาไทยเสมอ", "model")])
+
+    def test_model_replaces_and_retires_condition_when_user_asks(self):
+        self.fake.main_script = [tool_call("pin_condition", text="งบไม่เกิน 5000 บาท", source_id=1), {"content": "ok"}]
+        self.engine.send(self.chat, "งบไม่เกิน 5000 บาท")
+        old = self.engine.get_chat(self.chat)["state"][0]
+        self.fake.main_script = [
+            tool_call("pin_condition", text="งบไม่เกิน 8000 บาท", source_id=2, replaces=old["id"]), {"content": "ok"}]
+        self.engine.send(self.chat, "เปลี่ยนเป็น งบไม่เกิน 8000 บาท")
+        state = self.engine.get_chat(self.chat)["state"]
+        self.assertEqual([s["text"] for s in state], ["งบไม่เกิน 8000 บาท"])
+        self.fake.main_script = [tool_call("retire_state", item_id=state[0]["id"], reason="user cancelled",
+                                           user_quote="ไม่ต้องจำกัดงบแล้ว"), {"content": "ok"}]
+        turn = self.engine.send(self.chat, "ไม่ต้องจำกัดงบแล้ว ครับ")
+        self.assertTrue(turn["tools"][0]["result"].startswith("Retired [C"))
+        self.assertEqual(self.engine.get_chat(self.chat)["state"], [])
+
+    def test_over_cap_trims_oldest_retrieved_items_only(self):
+        self.fill(["apple pie", "apple tart", "cherry", "durian", "elder", "fig"])
+        self.engine.add_state(self.chat, "condition", "apple pie", source_tid=1)
+        self.engine.send(self.chat, "ที่เคยคุยเรื่อง apple")  # retrieves summaries of IDs 1 and 2
+        kinds = sorted(s["kind"] for s in self.engine.get_chat(self.chat)["state"])
+        self.assertEqual(kinds, ["condition", "summary", "summary"])
+        with self.engine.db() as con:
+            base = len(self.engine._render_state(con, self.chat, 99, self.engine.get_settings(), []))
+        self.engine.save_settings({"state_cap_chars": base - 20})
+        self.engine.send(self.chat, "hello")  # over the cap: retrieved summaries go first, 4a stays
+        kinds = [s["kind"] for s in self.engine.get_chat(self.chat)["state"]]
+        self.assertIn("condition", kinds)
+        self.assertLess(kinds.count("summary"), 2)
+
+    def test_streamed_send_emits_events_in_order(self):
+        fake = self.fake
+
+        def chat_stream(model, messages, on_text=None, **kw):
+            msg, usage = fake.chat(model, messages, **kw)
+            for piece in (msg.get("content") or "").split(" "):
+                if piece:
+                    on_text(piece + " ")
+            return msg, usage
+        fake.chat_stream = chat_stream
+        fake.main_script = [tool_call("add_note", text="step 1", source_id=1), {"content": "hello there"}]
+        events = []
+        turn = self.engine.send(self.chat, "hi", on_event=events.append)
+        types = [e["type"] for e in events]
+        self.assertEqual(types[:2], ["status", "round"])
+        self.assertIn("tool", types)
+        self.assertEqual(types.count("round"), 2)
+        self.assertEqual("".join(e["text"] for e in events if e["type"] == "delta"), "hello there ")
+        self.assertEqual(turn["answer"], "hello there")
+        self.assertNotIn(self.chat, self.engine._listeners)
 
     def test_decision_replaces_older_one(self):
         self.fill(["use 24h", "ok"])

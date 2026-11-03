@@ -41,6 +41,7 @@ function md(src) {
     const h = esc(part)
       .replace(/`([^`\n]+)`/g, "<code>$1</code>")
       .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*\w])\*([^*\s][^*\n]*?)\*(?!\w)/g, "$1<em>$2</em>")
       .replace(/^#{1,4} (.+)$/gm, '<span class="h">$1</span>');
     return `<div class="txt">${h}</div>`;
   }).join("");
@@ -59,6 +60,37 @@ function setStatus(text, isErr = false) {
   const s = $("#status");
   s.textContent = text || "";
   s.classList.toggle("err", isErr);
+}
+
+const TOOL_LABEL = {
+  search_memory: "ค้นความจำเก่า",
+  read_full: "อ่านข้อความเต็ม",
+  pin_condition: "ปักเงื่อนไข (4a)",
+  record_decision: "บันทึกข้อตัดสินใจ (4a)",
+  add_note: "จดโน้ต (4b)",
+  retire_state: "จัดชั้น 4",
+};
+const toolLabel = (name) => TOOL_LABEL[name] || name;
+
+function nearBottom(box) {
+  return box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+}
+
+// ---------- panel ----------
+
+const narrow = () => window.matchMedia("(max-width: 1100px)").matches;
+
+function setPanel(open, remember = true) {
+  $("#app").classList.toggle("panel-closed", !open);
+  $("#togglePanel").setAttribute("aria-expanded", String(open));
+  if (remember && !narrow()) {
+    try { localStorage.setItem("panelOpen", open ? "1" : "0"); } catch {}
+  }
+}
+
+function initialPanel() {
+  if (narrow()) return false;
+  try { return localStorage.getItem("panelOpen") !== "0"; } catch { return true; }
 }
 
 // ---------- loading ----------
@@ -131,8 +163,9 @@ function render() {
   $("#composer").hidden = !has;
   $("#panel").hidden = !has;
   $("#emptyState").hidden = has;
+  $("#app").classList.toggle("no-chat", !has);
   if (!has) {
-    $("#messages").querySelectorAll(".msg, .divider").forEach((n) => n.remove());
+    $("#messages").querySelectorAll(".msg, .divider, .chat-empty").forEach((n) => n.remove());
     return;
   }
   renderHeader();
@@ -143,6 +176,7 @@ function render() {
 function renderChatList() {
   const ul = $("#chatList");
   ul.innerHTML = "";
+  if (!S.chats.length) ul.append(el(`<li class="none">ยังไม่มีแชต</li>`));
   for (const c of S.chats) {
     const li = el(`<li class="${c.id === S.chatId ? "active" : ""}">
       <span class="t">${esc(c.title)}</span>
@@ -162,56 +196,80 @@ function renderHeader() {
   let compressSpan;
   if (comp) {
     const isCustom = comp.custom && (comp.custom.compress_at != null || comp.custom.round_size != null);
-    compressSpan = `<span>ชั้น 1: <b>${L.live}</b> เทิร์น · บีบอัดเมื่อครบ ${comp.compress_at} ครั้งละ ${comp.round_size}
-      <span class="muted small">${isCustom ? "ตั้งเฉพาะแชตนี้" : "ค่าเริ่มต้น"}</span>
+    compressSpan = `<span class="chip" title="ชั้น 1 = ข้อความล่าสุดที่โมเดลเห็นเต็ม ๆ">ชั้น 1 <b>${L.live}</b>/${comp.compress_at} เทิร์น
+      · บีบอัดครั้งละ ${comp.round_size}
+      <span class="badge ${isCustom ? "custom" : ""}">${isCustom ? "เฉพาะแชตนี้" : "ค่าเริ่มต้น"}</span>
       <button class="link" id="adjustCompress">ปรับ</button></span>`;
   } else {
-    compressSpan = `<span>ชั้น 1: <b>${L.live}</b> เทิร์น (สรุปเมื่อครบ ${L.next_summary_at})</span>`;
+    compressSpan = `<span class="chip">ชั้น 1 <b>${L.live}</b> เทิร์น (สรุปเมื่อครบ ${L.next_summary_at})</span>`;
   }
+  const pinned = c.state.filter((i) => i.kind === "condition" || i.kind === "decision").length;
+  const working = c.state.length - pinned;
   $("#layerBar").innerHTML = `
     ${compressSpan}
-    <span>ชั้น 2–3: <b>${L.archived}</b> ID</span>
-    <span class="${over ? "over" : ""}">ชั้น 4: <b>${fmtNum(L.state_chars)}</b> / ${fmtNum(L.state_cap)} ตัวอักษร</span>
-    <span>ค่าใช้จ่ายรวม: <b>${fmtUsd(cost)}</b></span>`;
+    <span class="chip" title="สรุปและข้อความเต็มของเทิร์นเก่า">ชั้น 2–3 <b>${L.archived}</b> ID</span>
+    <span class="chip ${over ? "over" : ""}" title="4a ปักไว้ทั้งแชต · 4b ความจำทำงาน">ชั้น 4 <b>4a ${pinned}</b> · <b>4b ${working}</b> · ${fmtNum(L.state_chars)}/${fmtNum(L.state_cap)} ตัวอักษร</span>
+    <span class="chip">ค่าใช้จ่าย <b>${fmtUsd(cost)}</b></span>`;
   const adjustBtn = $("#adjustCompress");
   if (adjustBtn) adjustBtn.onclick = openCompressDialog;
 }
 
+function userMsg(t, archived, pending = false) {
+  const u = el(`<div class="msg user ${archived ? "archived" : ""} ${pending ? "pending" : ""}">
+    <div class="meta-row">
+      ${pending ? "" : `<button class="link pin" title="ปักคำของคุณเป็นเงื่อนไขในชั้น 4a">📌 ปัก</button>`}
+      <span class="tag ${archived ? "arch" : "live"}">${archived ? "สรุปแล้ว" : "ชั้น 1"}</span>
+      <b>${pending ? "กำลังส่ง" : "ID " + t.tid}</b></div>
+    <div class="bubble md">${md(t.user)}</div></div>`);
+  const pin = u.querySelector(".pin");
+  if (pin) pin.onclick = () => openPin(t);
+  return u;
+}
+
+function turnChips(t) {
+  const m = t.meta || {};
+  const scanIds = (m.scans || []).flatMap((s) => s.ids);
+  const failed = (m.scans || []).some((s) => s.shards.some((x) => x.status === "failed"));
+  const chips = [];
+  if ((m.scans || []).length) chips.push(`สแกน ${m.scans.length} ครั้ง: ${scanIds.length ? "ID " + [...new Set(scanIds)].join(", ") : "ไม่พบ"}${failed ? " ⚠ มีชุดล้มเหลว" : ""}`);
+  const memTools = t.tools.filter((x) => ["pin_condition", "record_decision", "add_note", "retire_state"].includes(x.name)
+    && !String(x.result).startsWith("ERROR"));
+  if (memTools.length) chips.push(`อัปเดตชั้น 4 ${memTools.length} ครั้ง`);
+  else if (t.tools.length) chips.push(`tool ${t.tools.length} ครั้ง`);
+  if (m.stopped) chips.push(`⚠ หยุด: ${m.stopped}`);
+  chips.push(fmtUsd(m.cost));
+  return chips;
+}
+
 function renderMessages() {
   const box = $("#messages");
-  box.querySelectorAll(".msg, .divider").forEach((n) => n.remove());
+  // A reply being streamed stays put when something else re-renders the chat (e.g. a summary finishing).
+  const inFlight = S.sendingChat === S.chatId ? [...box.querySelectorAll(".msg.pending, .msg.streaming")] : [];
+  box.querySelectorAll(".msg, .divider, .chat-empty").forEach((n) => n.remove());
   const turns = S.chat.turns;
+  if (!turns.length && !inFlight.length) {
+    box.append(el(`<div class="chat-empty"><b>เริ่มคุยได้เลย</b>
+      บอกเป้าหมายหรือเงื่อนไขของงานไว้ตั้งแต่ต้น โมเดลจะปักไว้ในชั้น 4a เอง</div>`));
+  }
   let dividerDone = false;
   for (const t of turns) {
     const archived = !!t.summary;
     if (!archived && !dividerDone && turns.some((x) => x.summary)) {
-      box.append(el(`<div class="divider">ด้านบนถูกสรุปแล้ว (ชั้น 2 และ 3) · ด้านล่างอยู่ในชั้น 1</div>`));
+      box.append(el(`<div class="divider">ด้านบนถูกบีบอัดแล้ว (ชั้น 2–3) · ด้านล่างอยู่ในชั้น 1</div>`));
       dividerDone = true;
     }
-    const u = el(`<div class="msg user ${archived ? "archived" : ""}">
-      <div class="meta-row"><b>ID ${t.tid}</b>
-        <span class="tag ${archived ? "arch" : "live"}">${archived ? "สรุปแล้ว" : "ชั้น 1"}</span>
-        <button class="link pin">📌 ปักเป็นเงื่อนไข</button></div>
-      <div class="bubble md">${md(t.user)}</div></div>`);
-    u.querySelector(".pin").onclick = () => openPin(t);
-    box.append(u);
-
-    const m = t.meta || {};
-    const scanIds = (m.scans || []).flatMap((s) => s.ids);
-    const failed = (m.scans || []).some((s) => s.shards.some((x) => x.status === "failed"));
-    const chips = [];
-    if ((m.scans || []).length) chips.push(`สแกน ${m.scans.length} ครั้ง: ${scanIds.length ? "ID " + [...new Set(scanIds)].join(", ") : "ไม่พบ"}${failed ? " ⚠ มีชุดล้มเหลว" : ""}`);
-    if (t.tools.length) chips.push(`tool ${t.tools.length} ครั้ง`);
-    if (m.stopped) chips.push(`⚠ หยุด: ${m.stopped}`);
-    chips.push(fmtUsd(m.cost));
+    box.append(userMsg(t, archived));
     const a = el(`<div class="msg assistant ${archived ? "archived" : ""}">
       <div class="bubble md">${md(t.answer)}</div>
-      <div class="footer-chips">${chips.map((c) => `<span>${esc(c)}</span>`).join("·")}
+      <div class="footer-chips">${turnChips(t).map((c) => `<span>${esc(c)}</span>`).join("")}
         <button class="link insp">ตรวจสอบ</button></div></div>`);
-    a.querySelector(".insp").onclick = () => { S.inspectTid = t.tid; setTab("inspect"); };
+    a.querySelector(".insp").onclick = () => { S.inspectTid = t.tid; setPanel(true); setTab("inspect"); };
     box.append(a);
   }
+  box.append(...inFlight);
+  box.style.scrollBehavior = "auto";
   box.scrollTop = box.scrollHeight;
+  box.style.scrollBehavior = "";
 }
 
 function setTab(tab) {
@@ -227,51 +285,67 @@ function renderPanel() {
 }
 
 const KIND = {
-  condition: ["เงื่อนไข (condition)", "C", "คำของผู้ใช้ ใช้ตลอด ไม่หมดอายุ"],
-  decision: ["ข้อตัดสินใจ (decision)", "D", "ผู้ใช้ตกลงแล้ว ใช้จนมีข้อใหม่มาแทน"],
-  note: ["โน้ต (note)", "N", "โมเดลหลักเขียน อ้าง ID ในชั้น 1"],
-  summary: ["สรุปที่ดึงมา (summary)", "S", "จากชั้น 2"],
-  full: ["ข้อความเต็มที่ดึงมา (full)", "F", "จากชั้น 3 แทนสรุปของ ID นั้น"],
+  condition: ["เงื่อนไข", "C", "คำของคุณตรงตัว ไม่หมดอายุ"],
+  decision: ["ข้อตัดสินใจ", "D", "สิ่งที่คุณตกลงแล้ว ใช้จนมีข้อใหม่มาแทน"],
+  note: ["โน้ต", "N", "โมเดลจดระหว่างทำงาน"],
+  summary: ["สรุปที่ดึงมา", "S", "จากชั้น 2"],
+  full: ["ข้อความเต็มที่ดึงมา", "F", "จากชั้น 3 แทนสรุปของ ID นั้น"],
 };
+const ORIGIN = { model: "โมเดล", user: "คุณ", system: "ระบบ" };
+
+function stateCard(it) {
+  const kind = it.kind;
+  const [, letter] = KIND[kind];
+  const turn = S.chat.turns.find((t) => t.tid === it.source_tid);
+  let text = it.text;
+  if (kind === "summary" && turn?.summary) text = `user: ${turn.summary.user}\nanswer: ${turn.summary.answer}`;
+  if (kind === "full" && turn) text = `user: ${turn.user.slice(0, 400)}${turn.user.length > 400 ? "…" : ""}`;
+  const pinned = kind === "condition" || kind === "decision";
+  const card = el(`<div class="card ${pinned ? "pinned" : ""}">
+    <div class="row"><span><b>[${letter}${it.id}]</b>
+        <span class="origin ${esc(it.origin)}">${esc(ORIGIN[it.origin] || it.origin)}</span>
+        <span class="muted small">${it.source_tid != null ? "ID " + it.source_tid : "พิมพ์เอง"}${it.expires_tid ? " · หมดหลัง ID " + it.expires_tid : ""}</span></span>
+      <span class="actions">${["condition", "decision", "note"].includes(kind) ? '<button class="small edit">แก้</button>' : ""}
+        <button class="small off">เอาออก</button></span></div>
+    <div class="body">${esc(text)}</div></div>`);
+  card.querySelector(".off").onclick = async () => {
+    if (pinned && !confirm("เอารายการนี้ออกจากชั้น 4a?")) return;
+    await act(() => api("PATCH", `/api/chats/${S.chatId}/state/${it.id}`, { active: false }));
+  };
+  const edit = card.querySelector(".edit");
+  if (edit) edit.onclick = async () => {
+    const v = prompt("แก้ข้อความ", it.text);
+    if (v != null && v.trim() && v !== it.text) await act(() => api("PATCH", `/api/chats/${S.chatId}/state/${it.id}`, { text: v }));
+  };
+  return card;
+}
 
 function panelState(body) {
   const items = S.chat.state;
-  body.append(el(`<p class="muted small">ชั้น 4 ถูกวางท้ายข้อความล่าสุดที่ส่งให้ตัวทำงานหลักทุกครั้ง</p>`));
-  for (const [kind, [title, letter, hint]] of Object.entries(KIND)) {
-    const list = items.filter((i) => i.kind === kind);
-    body.append(el(`<h3>${title} <span class="muted small">${list.length} · ${hint}</span></h3>`));
-    for (const it of list) {
-      const turn = S.chat.turns.find((t) => t.tid === it.source_tid);
-      let text = it.text;
-      if (kind === "summary" && turn?.summary) text = `user: ${turn.summary.user}\nanswer: ${turn.summary.answer}`;
-      if (kind === "full" && turn) text = `user: ${turn.user.slice(0, 400)}…`;
-      const card = el(`<div class="card">
-        <div class="row"><b>[${letter}${it.id}]</b>
-          <span class="muted">${it.source_tid != null ? "ID " + it.source_tid : "พิมพ์เอง"}${it.expires_tid ? " · หมดหลัง ID " + it.expires_tid : ""} · ${it.origin}</span>
-          <span>${["condition", "decision", "note"].includes(kind) ? '<button class="small edit">แก้</button>' : ""}
-            <button class="small off">เอาออก</button></span></div>
-        <div class="body">${esc(text)}</div></div>`);
-      card.querySelector(".off").onclick = async () => {
-        if (kind === "condition" && !confirm("เอาเงื่อนไขนี้ออกจากชั้น 4?")) return;
-        await act(() => api("PATCH", `/api/chats/${S.chatId}/state/${it.id}`, { active: false }));
-      };
-      const edit = card.querySelector(".edit");
-      if (edit) edit.onclick = async () => {
-        const v = prompt("แก้ข้อความ", it.text);
-        if (v != null && v.trim() && v !== it.text) await act(() => api("PATCH", `/api/chats/${S.chatId}/state/${it.id}`, { text: v }));
-      };
-      body.append(card);
+  const groups = [
+    ["a", "4a · ปักไว้ทั้งแชต", "โมเดลปักเงื่อนไขจากคำของคุณและบันทึกสิ่งที่ตกลงกันเอง เอาออกได้เมื่อคุณขอ", ["condition", "decision"]],
+    ["b", "4b · ความจำระหว่างทำงาน", "โมเดลจดโน้ตและดึงความจำเก่ามาใช้เอง หมดอายุเอง และถูกตัดอัตโนมัติเมื่อเกินเพดาน", ["note", "summary", "full"]],
+  ];
+  for (const [cls, title, hint, kinds] of groups) {
+    const count = items.filter((i) => kinds.includes(i.kind)).length;
+    body.append(el(`<div class="layer-head ${cls}"><b>${title} (${count})</b><span class="muted">${hint}</span></div>`));
+    for (const kind of kinds) {
+      const [name, , kindHint] = KIND[kind];
+      const list = items.filter((i) => i.kind === kind);
+      body.append(el(`<h3>${name} <span class="muted small">${list.length} · ${kindHint}</span></h3>`));
+      if (!list.length) body.append(el(`<div class="none-yet">ยังไม่มี</div>`));
+      for (const it of list) body.append(stateCard(it));
     }
   }
-  const form = el(`<div class="card">
-    <b>เพิ่มเอง</b>
+  const form = el(`<details class="card manual">
+    <summary>เพิ่มเองด้วยมือ (ปกติไม่ต้อง โมเดลจัดการให้)</summary>
     <div class="form-row" style="margin-top:6px">
       <select class="kind"><option value="condition">condition</option><option value="decision">decision</option></select>
       <input class="src" type="number" min="1" placeholder="ID ต้นทาง (ไม่ใส่ก็ได้)">
     </div>
     <textarea class="txt" rows="3" style="margin-top:6px" placeholder="ข้อความ"></textarea>
     <div class="row" style="margin-top:6px"><span class="error"></span><button class="primary small add">เพิ่ม</button></div>
-  </div>`);
+  </details>`);
   form.querySelector(".add").onclick = async () => {
     try {
       await api("POST", `/api/chats/${S.chatId}/state`, {
@@ -362,7 +436,7 @@ function panelInspect(body) {
   body.append(el(`<h3>tool ที่โมเดลหลักเรียก</h3>`));
   if (!t.tools.length) body.append(el(`<p class="muted small">ไม่มี</p>`));
   for (const tool of t.tools) {
-    body.append(el(`<div class="card"><b>${esc(tool.name)}</b> <code>${esc(JSON.stringify(tool.args))}</code>
+    body.append(el(`<div class="card"><b>${esc(toolLabel(tool.name))}</b> <code>${esc(tool.name)}(${esc(JSON.stringify(tool.args))})</code>
       <div class="body">${esc(tool.result)}</div></div>`));
   }
 
@@ -419,35 +493,106 @@ async function act(fn) {
   }
 }
 
+// Reads the newline-delimited JSON events of /send_stream and hands each one to onEvent.
+async function streamEvents(path, body, onEvent) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let finished = false;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (value) buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      const ev = JSON.parse(line);
+      if (ev.type === "done" || ev.type === "error") finished = true;
+      onEvent(ev);
+    }
+    if (done) break;
+  }
+  if (!finished) throw new Error("การเชื่อมต่อกับเซิร์ฟเวอร์ขาดก่อนตอบเสร็จ (เซิร์ฟเวอร์ยังเปิดอยู่ไหม?)");
+}
+
+function autoGrow() {
+  const t = $("#input");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 220) + "px";
+}
+
 async function send() {
   const input = $("#input");
   const text = input.value.trim();
   if (!text || S.sending || !S.chat) return;
+  const forceScan = $("#forceScan").checked;
   S.sending = true;
+  S.sendingChat = S.chatId;
   $("#sendBtn").disabled = true;
-  const pending = el(`<div class="msg user pending"><div class="meta-row"><b>กำลังส่ง…</b></div><div class="bubble md">${md(text)}</div></div>`);
-  $("#messages").append(pending);
-  $("#messages").scrollTop = $("#messages").scrollHeight;
+  input.value = "";
+  autoGrow();
+  $("#messages").querySelector(".chat-empty")?.remove();
+
+  const box = $("#messages");
+  const userEl = userMsg({ user: text }, false, true);
+  const live = el(`<div class="msg assistant streaming">
+    <div class="steps"></div>
+    <div class="bubble md"><span class="typing"><i></i><i></i><i></i></span></div></div>`);
+  box.append(userEl, live);
+  box.scrollTop = box.scrollHeight;
   setStatus("กำลังเริ่ม…");
+
+  const bubble = live.querySelector(".bubble");
+  const steps = live.querySelector(".steps");
+  let answer = "";
+  let frame = 0;
+  const paint = () => {
+    frame = 0;
+    const stick = nearBottom(box);
+    bubble.innerHTML = answer ? md(answer) : `<span class="typing"><i></i><i></i><i></i></span>`;
+    if (stick) box.scrollTop = box.scrollHeight;
+  };
+  // A short timer rather than requestAnimationFrame, which stalls while the tab is in the background.
+  const schedule = () => { if (!frame) frame = setTimeout(paint, 40); };
+
   const id = S.chatId;
-  const poll = setInterval(async () => {
-    try {
-      const st = await api("GET", `/api/chats/${id}/status`);
-      if (st.busy) setStatus(st.busy + "…");
-    } catch {}
-  }, 800);
+  let failure = null;
   try {
-    await api("POST", `/api/chats/${id}/send`, { text, force_scan: $("#forceScan").checked });
-    input.value = "";
+    await streamEvents(`/api/chats/${id}/send_stream`, { text, force_scan: forceScan }, (ev) => {
+      if (ev.type === "status") setStatus(ev.text + "…");
+      else if (ev.type === "round") { answer = ""; schedule(); }
+      else if (ev.type === "delta") { answer += ev.text; schedule(); }
+      else if (ev.type === "tool") {
+        const bad = String(ev.result).startsWith("ERROR");
+        steps.append(el(`<span class="step ${bad ? "err" : "done"}" title="${esc(ev.result)}">${esc(toolLabel(ev.name))}</span>`));
+      } else if (ev.type === "done") { answer = ev.turn.answer; paint(); }
+      else if (ev.type === "error") failure = ev.error;
+    });
+  } catch (e) {
+    failure = e.message === "Failed to fetch" ? "ติดต่อเซิร์ฟเวอร์ไม่ได้ ตรวจว่ายังรัน server.py อยู่" : e.message;
+  }
+  if (frame) clearTimeout(frame);
+  S.sending = false;
+  S.sendingChat = null;
+  $("#sendBtn").disabled = false;
+  if (failure) {
+    userEl.remove();
+    live.remove();
+    if (!input.value) { input.value = text; autoGrow(); }
+    setStatus(failure, true);
+  } else {
     $("#forceScan").checked = false;
     setStatus("");
-  } catch (e) {
-    pending.remove();
-    setStatus(e.message, true);
-  } finally {
-    clearInterval(poll);
-    S.sending = false;
-    $("#sendBtn").disabled = false;
   }
   await loadChats();
   if (S.chatId === id) await refreshChat();
@@ -624,7 +769,21 @@ $("#sendBtn").onclick = send;
 $("#input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
+$("#input").addEventListener("input", autoGrow);
 $("#tabs").addEventListener("click", (e) => { if (e.target.dataset.tab) setTab(e.target.dataset.tab); });
+$("#togglePanel").onclick = () => setPanel($("#app").classList.contains("panel-closed"));
+$("#closePanel").onclick = () => setPanel(false);
+$("#scrim").onclick = () => setPanel(false, false);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && narrow() && !$("#app").classList.contains("panel-closed") && !document.querySelector("dialog[open]")) {
+    setPanel(false, false);
+  }
+});
+// Close the ⋯ menu after picking an item or clicking elsewhere.
+document.addEventListener("click", (e) => {
+  const menu = $("#chatMenu");
+  if (menu.open && (!menu.contains(e.target) || e.target.closest(".menu-list button"))) menu.open = false;
+});
 $("#chatTitle").onclick = async () => {
   const v = prompt("ชื่อแชต", S.chat.title);
   if (v && v.trim()) { await act(() => api("PATCH", `/api/chats/${S.chatId}`, { title: v })); await loadChats(); }
@@ -651,6 +810,7 @@ $("#forceSummarize").onclick = async () => {
 };
 
 (async function init() {
+  setPanel(initialPanel(), false);
   await loadSettings();
   await loadChats();
   let last = null;

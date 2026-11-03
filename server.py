@@ -172,6 +172,41 @@ class Handler(BaseHTTPRequestHandler):
     def send(self, body, chat_id):
         return engine.send(chat_id, body.get("text"), bool(body.get("force_scan")))
 
+    def send_stream(self, body, chat_id):
+        """Same as send, but answers with one JSON event per line while the reply is produced.
+
+        Events: status, round (a new model call starts; drop the text shown so far), delta, tool,
+        then done (the saved turn) or error. If the browser goes away the turn still finishes and is saved.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+        lock = threading.Lock()
+        gone = False
+
+        def emit(event):
+            nonlocal gone
+            if gone:
+                return
+            with lock:
+                try:
+                    self.wfile.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
+                    self.wfile.flush()
+                except OSError:
+                    gone = True
+
+        try:
+            turn = engine.send(chat_id, body.get("text"), bool(body.get("force_scan")), on_event=emit)
+            emit({"type": "done", "turn": turn})
+        except (UserError, BusyError, LLMError) as e:
+            emit({"type": "error", "error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            emit({"type": "error", "error": f"{type(e).__name__}: {e}"})
+
     def summarize(self, body, chat_id):
         done = engine.summarize_pending(chat_id, force=bool(body.get("force")))
         st = engine.status(chat_id)
@@ -222,6 +257,7 @@ ROUTES = [
     ("DELETE", r"/api/chats/(\d+)", Handler.delete_chat),
     ("GET", r"/api/chats/(\d+)/status", Handler.status),
     ("POST", r"/api/chats/(\d+)/send", Handler.send),
+    ("POST", r"/api/chats/(\d+)/send_stream", Handler.send_stream),
     ("POST", r"/api/chats/(\d+)/summarize", Handler.summarize),
     ("POST", r"/api/chats/(\d+)/scan", Handler.scan),
     ("PUT", r"/api/chats/(\d+)/summaries/(\d+)", Handler.put_summary),

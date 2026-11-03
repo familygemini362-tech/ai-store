@@ -70,6 +70,25 @@ ROLE_NAME = {"main": "ตัวทำงานหลัก", "scan": "ตัว�
 
 KIND_LABEL = {"condition": "C", "decision": "D", "note": "N", "summary": "S", "full": "F"}
 
+# Layer 4 has two parts. 4a holds what the user wants kept for the whole chat; it never expires.
+# 4b is working memory with an expiry the model curates; the system also trims it when over the cap.
+PINNED_KINDS = ("condition", "decision")
+WORKING_KINDS = ("note", "summary", "full")
+
+TOOL_STATUS = {
+    "search_memory": "กำลังค้นความจำเก่า",
+    "read_full": "กำลังอ่านข้อความเต็ม",
+    "pin_condition": "กำลังปักเงื่อนไข",
+    "record_decision": "กำลังบันทึกข้อตัดสินใจ",
+    "add_note": "กำลังจดโน้ต",
+    "retire_state": "กำลังจัดชั้น 4",
+}
+
+
+def squash(text):
+    """Collapse whitespace so a quote still matches when line breaks or spaces differ."""
+    return " ".join((text or "").split())
+
 
 class UserError(Exception):
     """Bad input or missing setting; shown to the user as-is."""
@@ -138,12 +157,14 @@ class OpenRouter:
         self.api_key = api_key
         self.timeout = timeout
 
-    def chat(self, model, messages, tools=None, tool_choice=None):
+    def _request(self, model, messages, tools, tool_choice, stream=False):
         body = {"model": model, "messages": messages, "usage": {"include": True}}
         if tools:
             body["tools"] = tools
         if tool_choice:
             body["tool_choice"] = tool_choice
+        if stream:
+            body["stream"] = True
         req = urllib.request.Request(
             self.URL,
             data=json.dumps(body).encode("utf-8"),
@@ -155,18 +176,64 @@ class OpenRouter:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                data = json.load(r)
+            return urllib.request.urlopen(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:600]
             raise LLMError(f"OpenRouter {e.code} ({model}): {detail}") from None
         except urllib.error.URLError as e:
             raise LLMError(f"เชื่อมต่อ OpenRouter ไม่ได้: {e.reason}") from None
+
+    def chat(self, model, messages, tools=None, tool_choice=None):
+        with self._request(model, messages, tools, tool_choice) as r:
+            data = json.load(r)
         if data.get("error"):
             raise LLMError(f"OpenRouter ({model}): {data['error'].get('message', data['error'])}")
         if not data.get("choices"):
             raise LLMError(f"OpenRouter ({model}) ไม่ส่งคำตอบกลับมา")
         return data["choices"][0]["message"], data.get("usage") or {}
+
+    def chat_stream(self, model, messages, tools=None, tool_choice=None, on_text=None):
+        """Same result as chat(), but reads server-sent events and calls on_text(piece) as text arrives."""
+        text, calls, usage, got_choice = [], {}, {}, False
+        try:
+            with self._request(model, messages, tools, tool_choice, stream=True) as r:
+                for raw in r:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue  # blank lines and ": OPENROUTER PROCESSING" keep-alives
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    chunk = json.loads(payload)
+                    if chunk.get("error"):
+                        err = chunk["error"]
+                        raise LLMError(f"OpenRouter ({model}): {err.get('message', err) if isinstance(err, dict) else err}")
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    for choice in chunk.get("choices") or []:
+                        got_choice = True
+                        delta = choice.get("delta") or {}
+                        piece = delta.get("content")
+                        if piece:
+                            text.append(piece)
+                            if on_text:
+                                on_text(piece)
+                        for tc in delta.get("tool_calls") or []:
+                            slot = calls.setdefault(tc.get("index", 0), {
+                                "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            if tc.get("id"):
+                                slot["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            slot["function"]["name"] += fn.get("name") or ""
+                            slot["function"]["arguments"] += fn.get("arguments") or ""
+        except (OSError, ValueError) as e:  # dropped connection or a broken chunk mid-stream
+            raise LLMError(f"สตรีมจาก OpenRouter ขาดกลางทาง ({model}): {e}") from None
+        if not got_choice:
+            raise LLMError(f"OpenRouter ({model}) ไม่ส่งคำตอบกลับมา")
+        msg = {"role": "assistant", "content": "".join(text)}
+        if calls:
+            msg["tool_calls"] = [calls[i] for i in sorted(calls)]
+        return msg, usage
 
 
 class Meter:
@@ -198,6 +265,7 @@ class Engine:
         self._sum_locks = {}
         self._busy = {}
         self._errors = {}
+        self._listeners = {}  # chat_id -> callback(event dict) while a streamed send runs
         with self.db() as con:
             con.executescript(SCHEMA)
             # Migration for DBs created before per-chat compression overrides existed.
@@ -285,6 +353,13 @@ class Engine:
 
     def _set_busy(self, chat_id, text):
         self._busy[chat_id] = text
+        if text:
+            self._emit(chat_id, {"type": "status", "text": text})
+
+    def _emit(self, chat_id, event):
+        listener = self._listeners.get(chat_id)
+        if listener:
+            listener(event)
 
     # ---------- chats ----------
 
@@ -447,12 +522,16 @@ class Engine:
 
     # ---------- model calls ----------
 
-    def _call(self, chat_id, tid, role, model, messages, meter, settings, **kw):
+    def _call(self, chat_id, tid, role, model, messages, meter, settings, on_text=None, **kw):
         if not settings["api_key"]:
             raise UserError("ยังไม่ได้ใส่ OpenRouter API key")
         if not model:
             raise UserError(f"ยังไม่ได้เลือกโมเดลของ{ROLE_NAME[role]}")
-        msg, usage = self.client_factory(settings["api_key"]).chat(model, messages, **kw)
+        client = self.client_factory(settings["api_key"])
+        if on_text and hasattr(client, "chat_stream"):
+            msg, usage = client.chat_stream(model, messages, on_text=on_text, **kw)
+        else:
+            msg, usage = client.chat(model, messages, **kw)
         meter.add(role, model, usage)
         with self.db() as con:
             con.execute(
@@ -613,7 +692,26 @@ class Engine:
 
     # ---------- layer 4 rendering ----------
 
-    def _render_state(self, con, chat_id, cur, settings, scans):
+    def _render_state(self, con, chat_id, cur, settings, scans, trim=False):
+        """Layer 4 as the <memory_state> block. trim=True (only when sending) retires the oldest
+        retrieved 4b items until the block fits the cap; 4a and notes are never trimmed here."""
+        text, trimmed = self._render_state_once(con, chat_id, cur, settings, scans, []), []
+        while trim and len(text) > settings["state_cap_chars"]:
+            victim = None
+            for r in con.execute("SELECT id, kind, expires_tid FROM state WHERE chat_id = ? AND active = 1 "
+                                 "AND kind IN ('summary', 'full') ORDER BY expires_tid, id", (chat_id,)):
+                ttl = settings["full_ttl"] if r["kind"] == "full" else settings["summary_ttl"]
+                if r["expires_tid"] is None or r["expires_tid"] - ttl < cur:  # skip items fetched this turn
+                    victim = r
+                    break
+            if not victim:
+                break
+            con.execute("UPDATE state SET active = 0 WHERE id = ?", (victim["id"],))
+            trimmed.append(f"{KIND_LABEL[victim['kind']]}{victim['id']}")
+            text = self._render_state_once(con, chat_id, cur, settings, scans, trimmed)
+        return text
+
+    def _render_state_once(self, con, chat_id, cur, settings, scans, trimmed):
         items = con.execute("SELECT * FROM state WHERE chat_id = ? AND active = 1 ORDER BY id",
                             (chat_id,)).fetchall()
         sections = {k: [] for k in KIND_LABEL}
@@ -648,12 +746,15 @@ class Engine:
             failed = [s["range"] for s in sc["shards"] if s["status"] == "failed"]
             head.append(f"Automatic scan this turn ({sc.get('trigger')}): found IDs {sc['ids'] or 'none'}"
                         + (f"; FAILED shards {failed} — tell the user the search was incomplete" if failed else ""))
+        if trimmed:
+            head.append(f"Layer 4 was over its cap, so the system retired the oldest retrieved items: "
+                        f"{', '.join(trimmed)}. Fetch them again if you still need them.")
         titles = {
-            "condition": "Conditions (from the user, always apply)",
-            "decision": "Decisions (agreed by the user)",
-            "note": "Notes",
-            "summary": "Retrieved summaries (layer 2)",
-            "full": "Retrieved full text (layer 3)",
+            "condition": "4a Conditions (the user's own words, always apply)",
+            "decision": "4a Decisions (agreed by the user)",
+            "note": "4b Notes",
+            "summary": "4b Retrieved summaries (layer 2)",
+            "full": "4b Retrieved full text (layer 3)",
         }
         body = "\n".join(head)
         for k, lines in sections.items():
@@ -661,12 +762,14 @@ class Engine:
                 body += f"\n\n## {titles[k]}\n" + "\n".join(lines)
         cap = settings["state_cap_chars"]
         if len(body) > cap:
-            body += f"\n\nWARNING: layer 4 is {len(body):,} chars, over the cap of {cap:,}. Suggest items to retire."
+            body += (f"\n\nWARNING: layer 4 is {len(body):,} chars, over the cap of {cap:,}. "
+                     "Retire notes or retrieved items you no longer need with retire_state.")
         return f"<memory_state>\n{body}\n</memory_state>"
 
     # ---------- main turn ----------
 
-    def send(self, chat_id, text, force_scan=False):
+    def send(self, chat_id, text, force_scan=False, on_event=None):
+        """Run one user message. on_event(dict) receives status/round/delta/tool events as they happen."""
         text = (text or "").strip()
         if not text:
             raise UserError("ข้อความว่าง")
@@ -674,6 +777,8 @@ class Engine:
         lock = self._lock(self._send_locks, chat_id)
         if not lock.acquire(blocking=False):
             raise BusyError("แชตนี้กำลังตอบอยู่")
+        if on_event:
+            self._listeners[chat_id] = on_event
         try:
             meter, trace, scans = Meter(), [], []
             with self.db() as con:
@@ -696,7 +801,7 @@ class Engine:
             with self.db() as con:
                 live = con.execute("SELECT tid, user, answer FROM turns WHERE chat_id = ? AND summary IS NULL "
                                    "ORDER BY tid", (chat_id,)).fetchall()
-                state_text = self._render_state(con, chat_id, cur, settings, scans)
+                state_text = self._render_state(con, chat_id, cur, settings, scans, trim=True)
             messages = [{"role": "system", "content": prompts.MAIN_SYSTEM}]
             for r in live:
                 messages.append({"role": "user", "content": f"[ID {r['tid']}] {r['user']}"})
@@ -704,7 +809,7 @@ class Engine:
             messages.append({"role": "user", "content": f"[ID {cur}] {text}\n\n{state_text}"})
             prompt_chars = sum(len(m["content"]) for m in messages)
 
-            answer, stopped = self._run_main(chat_id, cur, messages, settings, meter, trace, scans)
+            answer, stopped = self._run_main(chat_id, cur, text, messages, settings, meter, trace, scans)
             meta = {
                 "scans": scans,
                 "prompt_chars": prompt_chars,
@@ -722,18 +827,29 @@ class Engine:
                      json.dumps(meta, ensure_ascii=False), time.time()))
         finally:
             self._set_busy(chat_id, None)
+            self._listeners.pop(chat_id, None)
             lock.release()
         self._after_turn(chat_id)
         return {"tid": cur, "user": text, "answer": answer, "tools": trace, "meta": meta, "summary": None}
 
-    def _run_main(self, chat_id, cur, messages, settings, meter, trace, scans):
-        model = settings["model_main"]
+    def _main_call(self, chat_id, cur, messages, settings, meter, **kw):
+        """One main-model call. While a listener is attached the reply is streamed as delta events."""
+        self._emit(chat_id, {"type": "round"})
+        on_text = None
+        if self._listeners.get(chat_id):
+            on_text = lambda piece: self._emit(chat_id, {"type": "delta", "text": piece})  # noqa: E731
+        return self._call(chat_id, cur, "main", settings["model_main"], messages, meter, settings,
+                          on_text=on_text, tools=prompts.TOOLS, **kw)
+
+    def _run_main(self, chat_id, cur, user_text, messages, settings, meter, trace, scans):
         last_text = ""
         for _ in range(settings["max_tool_rounds"]):
             if meter.cost >= settings["max_usd_per_message"]:
-                return (last_text + "\n\n⚠️ หยุดเพราะใช้งบถึงเพดานต่อข้อความแล้ว").strip(), "budget"
+                note = "\n\n⚠️ หยุดเพราะใช้งบถึงเพดานต่อข้อความแล้ว"
+                self._emit(chat_id, {"type": "delta", "text": note})
+                return (last_text + note).strip(), "budget"
             self._set_busy(chat_id, "โมเดลหลักกำลังคิด")
-            msg = self._call(chat_id, cur, "main", model, messages, meter, settings, tools=prompts.TOOLS)
+            msg = self._main_call(chat_id, cur, messages, settings, meter)
             last_text = message_text(msg)
             calls = msg.get("tool_calls") or []
             if not calls:
@@ -744,22 +860,30 @@ class Engine:
                 args = {}
                 try:
                     args = json.loads(c["function"].get("arguments") or "{}")
-                    self._set_busy(chat_id, f"ใช้เครื่องมือ {name}")
-                    result = self._tool(chat_id, cur, name, args, settings, meter, scans)
+                    self._set_busy(chat_id, TOOL_STATUS.get(name, f"ใช้เครื่องมือ {name}"))
+                    result = self._tool(chat_id, cur, user_text, name, args, settings, meter, scans)
                 except UserError:
                     raise
                 except Exception as e:  # noqa: BLE001 - reported back to the model as the tool result
                     result = f"ERROR: {e}"
-                trace.append({"name": name, "args": args, "result": clip(result, settings["tool_limit"])})
+                entry = {"name": name, "args": args, "result": clip(result, settings["tool_limit"])}
+                trace.append(entry)
+                self._emit(chat_id, {"type": "tool", **entry})
                 messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "content": result})
         self._set_busy(chat_id, "โมเดลหลักกำลังสรุปคำตอบ")
-        msg = self._call(chat_id, cur, "main", model, messages, meter, settings,
-                         tools=prompts.TOOLS, tool_choice="none")
+        msg = self._main_call(chat_id, cur, messages, settings, meter, tool_choice="none")
         return message_text(msg), "max_tool_rounds"
 
     # ---------- tools for the main model ----------
 
-    def _tool(self, chat_id, cur, name, args, settings, meter, scans):
+    def _user_words(self, con, chat_id, cur, user_text, tid):
+        """The user's own text for turn tid (the current turn is not stored yet)."""
+        if tid == cur:
+            return user_text
+        row = con.execute("SELECT user FROM turns WHERE chat_id = ? AND tid = ?", (chat_id, tid)).fetchone()
+        return row["user"] if row else None
+
+    def _tool(self, chat_id, cur, user_text, name, args, settings, meter, scans):
         if name == "search_memory":
             query = str(args.get("query") or "").strip()
             if not query:
@@ -799,6 +923,38 @@ class Engine:
                                    f"assistant: {clip(t['answer'], settings['full_char_limit'])}")
             return "\n\n".join(out)
 
+        if name == "pin_condition":
+            # Rule 3.5: a condition is the user's own words. The code checks the quote, not the prompt.
+            text = str(args.get("text") or "").strip()
+            src = int(args.get("source_id"))
+            if not text:
+                return "ERROR: text is empty"
+            if len(text) > 1000:
+                return "ERROR: a condition must be under 1,000 characters. Quote only the requirement itself."
+            with self.db() as con:
+                words = self._user_words(con, chat_id, cur, user_text, src)
+                if words is None:
+                    return f"ERROR: ID {src} does not exist"
+                if squash(text) not in squash(words):
+                    return (f"ERROR: the text is not a verbatim quote of the user's message ID {src}. "
+                            "Copy the user's exact words; do not paraphrase or translate.")
+                replaced = ""
+                if args.get("replaces") is not None:
+                    old = con.execute("SELECT id FROM state WHERE id = ? AND chat_id = ? AND kind = 'condition' "
+                                      "AND active = 1", (int(args["replaces"]), chat_id)).fetchone()
+                    if not old:
+                        return f"ERROR: no active condition {args['replaces']}"
+                    con.execute("UPDATE state SET active = 0 WHERE id = ?", (old["id"],))
+                    replaced = f" Retired [C{old['id']}]."
+                for r in con.execute("SELECT id, text FROM state WHERE chat_id = ? AND kind = 'condition' "
+                                     "AND active = 1", (chat_id,)):
+                    if squash(r["text"]) == squash(text):
+                        return f"Already pinned as [C{r['id']}].{replaced}"
+                new = con.execute(
+                    "INSERT INTO state(chat_id, kind, text, source_tid, created_tid, expires_tid, origin) "
+                    "VALUES(?, 'condition', ?, ?, ?, NULL, 'model')", (chat_id, text, src, cur)).lastrowid
+            return f"Pinned as [C{new}].{replaced}"
+
         if name == "record_decision":
             text = str(args.get("text") or "").strip()
             src = int(args.get("source_id"))
@@ -807,16 +963,22 @@ class Engine:
             if not 1 <= src <= cur:
                 return f"ERROR: source_id must be between 1 and {cur}"
             with self.db() as con:
+                replaced = ""
                 if args.get("replaces") is not None:
                     old = con.execute("SELECT id FROM state WHERE id = ? AND chat_id = ? AND kind = 'decision' "
                                       "AND active = 1", (int(args["replaces"]), chat_id)).fetchone()
                     if not old:
                         return f"ERROR: no active decision {args['replaces']}"
                     con.execute("UPDATE state SET active = 0 WHERE id = ?", (old["id"],))
+                    replaced = f" Retired [D{old['id']}]."
+                for r in con.execute("SELECT id, text FROM state WHERE chat_id = ? AND kind = 'decision' "
+                                     "AND active = 1", (chat_id,)):
+                    if squash(r["text"]) == squash(text):
+                        return f"Already recorded as [D{r['id']}].{replaced}"
                 new = con.execute(
                     "INSERT INTO state(chat_id, kind, text, source_tid, created_tid, expires_tid, origin) "
                     "VALUES(?, 'decision', ?, ?, ?, NULL, 'model')", (chat_id, text, src, cur)).lastrowid
-            return f"Recorded as [D{new}]."
+            return f"Recorded as [D{new}].{replaced}"
 
         if name == "add_note":
             text = str(args.get("text") or "").strip()
@@ -841,11 +1003,15 @@ class Engine:
                                   (item, chat_id)).fetchone()
                 if not row:
                     return f"ERROR: no active item {item}"
-                if row["kind"] == "condition":
-                    return "ERROR: conditions can only be removed by the user."
-                if row["kind"] == "decision":
-                    return "ERROR: replace decisions with record_decision(replaces=...), or ask the user."
+                if row["kind"] in PINNED_KINDS:
+                    # 4a only goes when the user asks for it in this message; the quote proves it.
+                    quote = squash(str(args.get("user_quote") or ""))
+                    if not quote:
+                        return (f"ERROR: [{KIND_LABEL[row['kind']]}{item}] is in 4a. Retire it only when the user "
+                                "asks in the current message, and pass their exact words as user_quote.")
+                    if quote not in squash(user_text):
+                        return "ERROR: user_quote is not a verbatim quote of the user's current message."
                 con.execute("UPDATE state SET active = 0 WHERE id = ?", (item,))
-            return f"Retired item {item}."
+            return f"Retired [{KIND_LABEL[row['kind']]}{item}]."
 
         return f"ERROR: unknown tool {name}"

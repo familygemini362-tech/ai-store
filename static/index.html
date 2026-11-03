@@ -7,13 +7,13 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="app">
+<div class="app" id="app">
   <aside class="sidebar">
-    <div class="brand">ความจำ 4 ชั้น</div>
-    <button id="newChat" class="primary wide">+ แชตใหม่</button>
+    <div class="brand"><span class="logo">◆</span> ความจำ 4 ชั้น</div>
+    <button id="newChat" class="primary wide">＋ แชตใหม่</button>
     <ul id="chatList" class="chat-list"></ul>
-    <button id="openSettings" class="wide">⚙ ตั้งค่า key และโมเดล</button>
     <div id="setupHint" class="hint"></div>
+    <button id="openSettings" class="ghost wide">⚙ ตั้งค่า key และโมเดล</button>
   </aside>
 
   <main class="main">
@@ -21,9 +21,17 @@
       <div class="title-row">
         <h1 id="chatTitle" title="คลิกเพื่อเปลี่ยนชื่อ"></h1>
         <div class="head-actions">
-          <button id="forceSummarize" title="สรุปรอบที่เก่าที่สุดทันที แม้ยังไม่ถึงเกณฑ์">สรุปรอบถัดไป</button>
-          <button id="exportChat">ส่งออก JSON</button>
-          <button id="deleteChat" class="danger">ลบแชต</button>
+          <details class="menu" id="chatMenu">
+            <summary class="icon-btn" title="คำสั่งอื่น" aria-label="คำสั่งอื่น">⋯</summary>
+            <div class="menu-list">
+              <button id="forceSummarize" title="สรุปรอบที่เก่าที่สุดทันที แม้ยังไม่ถึงเกณฑ์">สรุปรอบถัดไปตอนนี้</button>
+              <button id="exportChat">ส่งออก JSON</button>
+              <button id="deleteChat" class="danger">ลบแชตนี้</button>
+            </div>
+          </details>
+          <button id="togglePanel" class="icon-btn" title="เปิด/ปิดแผงความจำ" aria-label="เปิด/ปิดแผงความจำ" aria-expanded="true">
+            <span class="panel-icon" aria-hidden="true"></span>
+          </button>
         </div>
       </div>
       <div class="layer-bar" id="layerBar"></div>
@@ -31,18 +39,22 @@
 
     <section class="messages" id="messages">
       <div class="empty" id="emptyState">
+        <div class="empty-logo">◆</div>
         <h2>เริ่มจากตั้งค่า แล้วสร้างแชตใหม่</h2>
         <p>ใส่ OpenRouter key และเลือกโมเดล 3 ตัว: ตัวสรุป ตัววิ่งหาข้อมูล และตัวทำงานหลัก</p>
       </div>
     </section>
 
     <footer class="composer" id="composer" hidden>
-      <div class="status" id="status"></div>
-      <div class="compose-row">
-        <textarea id="input" rows="3" placeholder="พิมพ์ข้อความ… (Enter เพื่อส่ง, Shift+Enter ขึ้นบรรทัดใหม่)"></textarea>
-        <button id="sendBtn" class="primary">ส่ง</button>
+      <div class="status" id="status" aria-live="polite"></div>
+      <div class="compose-box">
+        <textarea id="input" rows="1" placeholder="พิมพ์ข้อความ…"></textarea>
+        <button id="sendBtn" class="send-btn primary" title="ส่ง (Enter)" aria-label="ส่ง">➤</button>
       </div>
-      <label class="check"><input type="checkbox" id="forceScan"> บังคับสแกนความจำก่อนตอบ</label>
+      <div class="compose-foot">
+        <label class="check"><input type="checkbox" id="forceScan"> บังคับสแกนความจำก่อนตอบ</label>
+        <span class="muted small">Enter ส่ง · Shift+Enter ขึ้นบรรทัดใหม่</span>
+      </div>
     </footer>
   </main>
 
@@ -52,9 +64,11 @@
       <button data-tab="summaries">ชั้น 2</button>
       <button data-tab="inspect">ตรวจสอบ</button>
       <button data-tab="scan">ทดสอบสแกน</button>
+      <button class="icon-btn panel-close" id="closePanel" title="พับแผง" aria-label="พับแผง">✕</button>
     </nav>
     <div class="panel-body" id="panelBody"></div>
   </aside>
+  <div class="scrim" id="scrim"></div>
 </div>
 
 <dialog id="settingsDialog">
@@ -90,8 +104,8 @@
         <label>เริ่มบีบอัดเมื่อชั้น 1 ครบ (เทิร์น) <input type="number" min="2" name="compress_at"></label>
         <label>บีบอัดครั้งละ (เทิร์น) <input type="number" min="1" name="round_size"></label>
         <label>ID ต่อชุดสแกน <input type="number" min="1" name="shard_size"></label>
-        <label>อายุสรุปในชั้น 4 (เทิร์น) <input type="number" min="1" name="summary_ttl"></label>
-        <label>อายุข้อความเต็มในชั้น 4 <input type="number" min="1" name="full_ttl"></label>
+        <label>อายุสรุปในชั้น 4b (เทิร์น) <input type="number" min="1" name="summary_ttl"></label>
+        <label>อายุข้อความเต็มในชั้น 4b <input type="number" min="1" name="full_ttl"></label>
         <label>อายุโน้ตเริ่มต้น <input type="number" min="1" name="note_ttl"></label>
         <label>เพดานชั้น 4 (ตัวอักษร) <input type="number" min="1" name="state_cap_chars"></label>
         <label>ตัดผล tool ที่ส่งให้ตัวสรุป <input type="number" min="1" name="tool_limit"></label>
